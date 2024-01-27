@@ -1,7 +1,11 @@
 use crate::prelude::*;
 use bevy::render::render_resource::*;
 use bevy::render::*;
-use geo::{Simplify, TriangulateEarcut};
+use density_mesh_core::{
+    generator::DensityMeshGenerator,
+    map::DensityMap,
+    mesh::{points_separation::PointsSeparation, settings::GenerateDensityMeshSettings},
+};
 use itertools::Itertools;
 use smallvec::{SmallVec, ToSmallVec};
 
@@ -206,13 +210,13 @@ pub fn extract_images(
     }
 }
 
-pub fn image_values(image: &Image) -> Vec<f64> {
+pub fn image_values(image: &Image) -> Vec<u8> {
     let mut values = vec![];
     for pixel in image.data.chunks_exact(4) {
         if pixel[3] > 0 {
-            values.push(1.)
+            values.push(255)
         } else {
-            values.push(0.)
+            values.push(0)
         }
     }
 
@@ -236,13 +240,39 @@ pub fn image_atoms(image: &Image) -> Vec<Atom> {
     atoms
 }
 
+//TODO Add multiple colliders support
 pub fn get_collider(
-    values: &[f64],
+    values: &[u8],
     width: u32,
     height: u32,
     origin: (f64, f64),
 ) -> Option<Collider> {
-    let c = ContourBuilder::new(width, height, false)
+    let map = DensityMap::new(width as usize, height as usize, 1, values.to_vec()).unwrap();
+    let settings = GenerateDensityMeshSettings {
+        points_separation: PointsSeparation::SteepnessMapping(0., 10.),
+
+        ..Default::default()
+    };
+    let mut mesh = DensityMeshGenerator::new(vec![], map, settings);
+    mesh.process_wait().unwrap_or_default();
+    let Some(mesh) = mesh.mesh() else {
+        return None;
+    };
+
+    let mut colliders = vec![];
+    for triangle in &mesh.triangles {
+        let collider = Collider::triangle(
+            vec2(mesh.points[triangle.a].x, -mesh.points[triangle.a].y)
+                + vec2(origin.0 as f32, -origin.1 as f32),
+            vec2(mesh.points[triangle.b].x, -mesh.points[triangle.b].y)
+                + vec2(origin.0 as f32, -origin.1 as f32),
+            vec2(mesh.points[triangle.c].x, -mesh.points[triangle.c].y)
+                + vec2(origin.0 as f32, -origin.1 as f32),
+        );
+        colliders.push((Vec2::ZERO, 0.0_f32, collider));
+    }
+
+    /*let c = ContourBuilder::new(width, height, false)
         .x_origin(origin.0)
         .y_origin(origin.1);
 
@@ -262,7 +292,7 @@ pub fn get_collider(
                 colliders.push((Vec2::ZERO, 0.0_f32, collider));
             }
         }
-    }
+    }*/
     if !colliders.is_empty() {
         Some(Collider::compound(colliders))
     } else {

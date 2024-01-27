@@ -45,7 +45,6 @@ mod prelude {
     pub use std::sync::{Arc, RwLock};
 
     pub use bevy_rapier2d::prelude::*;
-    pub use contour::ContourBuilder;
 
     pub use crate::materials::Material;
     pub use bevy_egui::EguiContext;

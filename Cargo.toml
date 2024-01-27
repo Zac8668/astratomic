@@ -22,10 +22,11 @@ serde-big-array     = "0.5"
 ron                 = "0.8"
 bevy-async-task     = "1.3"
 
-contour = "0.12"
-bevy_rapier2d = { version = "0.23", features = [ "simd-stable", "debug-render-2d", "parallel" ] }
-geo = "0.27"
-rotsprite = "0.1"
+contour             = "0.12"
+bevy_rapier2d       = { version = "0.23", features = [ "simd-stable", "debug-render-2d", "parallel" ] }
+geo                 = "0.27"
+rotsprite           = "0.1"
+density-mesh-core   = "1.5"
 
 egui                = "0.24"
 bevy_egui           = "0.24"

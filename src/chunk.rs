@@ -97,15 +97,15 @@ impl Chunk {
         )
     }
 
-    pub fn get_values(&self, materials: &Materials) -> Vec<f64> {
+    pub fn get_values(&self, materials: &Materials) -> Vec<u8> {
         let mut values = vec![];
 
         for row in self.atoms.chunks(CHUNK_LENGHT) {
             for atom in row {
                 if materials[atom].is_solid() {
-                    values.push(1.)
+                    values.push(255)
                 } else {
-                    values.push(0.)
+                    values.push(0)
                 }
             }
         }
