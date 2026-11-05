@@ -22,6 +22,9 @@ serde-big-array     = "0.5"
 ron                 = "0.8"
 bevy_async_task = "0.4.0"
 
+sled = "0.34"
+zstd = "0.13"
+
 contour = "0.13"
 bevy_rapier2d = { version = "0.28", features = [ "simd-stable", "debug-render-2d", "parallel" ] }
 geo = "0.29"

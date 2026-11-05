@@ -21,4 +21,8 @@
     ( flow: 5, damage: 3.0, default_state: Liquid),
     //10 Compacted dirt
     (default_state: Solid),
+    //11 Leaves
+    (default_state: Solid),
+    //12 Wood
+    (default_state: Solid)
 ])

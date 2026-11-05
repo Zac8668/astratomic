@@ -82,7 +82,7 @@ pub fn update_actors(mut chunk_manager: ResMut<ChunkManager>, mut actors: Query<
             let move_hor = match (prev.x != v.x, prev.y != v.y) {
                 (true, false) => true,
                 (false, true) => false,
-                (true, true) => fastrand::bool(),
+                (true, true) => true,
                 _ => unreachable!(),
             };
 
@@ -146,11 +146,11 @@ pub fn move_x(chunk_manager: &mut ChunkManager, actor: &mut Actor, dir: i32) -> 
         // Check bounds and if it's free to move
         if let Some(atom) = chunk_manager.get_mut_atom(chunk_pos) {
             if atom.is_powder() || atom.is_solid() {
-                actor.vel = Vec2::ZERO;
+                actor.vel.x = 0.0;
                 return false;
             }
         } else {
-            actor.vel = Vec2::ZERO;
+            actor.vel.x = 0.0;
             return false;
         }
     }
@@ -176,11 +176,11 @@ pub fn move_y(chunk_manager: &mut ChunkManager, actor: &mut Actor, dir: i32) -> 
         // Check bounds and if it's free to move
         if let Some(atom) = chunk_manager.get_mut_atom(chunk_pos) {
             if atom.is_powder() || atom.is_solid() {
-                actor.vel = Vec2::ZERO;
+                actor.vel.y = 0.0;
                 return false;
             }
         } else {
-            actor.vel = Vec2::ZERO;
+            actor.vel.y = 0.0;
             return false;
         }
     }

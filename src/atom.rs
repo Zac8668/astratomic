@@ -91,9 +91,9 @@ impl Atom {
             6 => {
                 //Grass
                 atom.color = [
-                    (30 + rand::rng().random_range(-10_i16..10_i16)) as u8,
-                    (170 + rand::rng().random_range(-10_i16..10_i16)) as u8,
-                    (10 + rand::rng().random_range(-5_i16..5_i16)) as u8,
+                    (40 + rand::rng().random_range(-10_i16..10_i16)) as u8,
+                    (165 + rand::rng().random_range(-10_i16..10_i16)) as u8,
+                    (49 + rand::rng().random_range(-5_i16..5_i16)) as u8,
                     255,
                 ];
             }
@@ -130,6 +130,24 @@ impl Atom {
                     (100 + rand::rng().random_range(-10_i16..10_i16)) as u8,
                     (50 + rand::rng().random_range(-10_i16..10_i16)) as u8,
                     (30 + rand::rng().random_range(-5_i16..5_i16)) as u8,
+                    255,
+                ];
+            }
+            11 => {
+                // Leaves
+                atom.color = [
+                    (60 + rand::rng().random_range(-15_i16..15_i16)) as u8,
+                    (180 + rand::rng().random_range(-20_i16..20_i16)) as u8,
+                    (60 + rand::rng().random_range(-10_i16..10_i16)) as u8,
+                    220,
+                ];
+            }
+            12 => {
+                // Wood
+                atom.color = [
+                    (120 + rand::rng().random_range(-10_i16..10_i16)) as u8,
+                    (80 + rand::rng().random_range(-10_i16..10_i16)) as u8,
+                    (40 + rand::rng().random_range(-5_i16..5_i16)) as u8,
                     255,
                 ];
             }

@@ -1,7 +1,45 @@
 use crate::prelude::*;
 
-use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
+
+#[derive(Component)]
+struct FpsText;
+
+fn spawn_fps_ui(mut commands: Commands) {
+    let text_style = TextFont {
+        font_size: 18.0,
+        ..Default::default()
+    };
+    let text_color = TextColor(Color::srgb(0.9, 0.9, 0.9));
+
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(10.0),
+            top: Val::Px(70.0),
+            ..Default::default()
+        })
+        .with_children(|parent| {
+            parent.spawn((Text::new("FPS: --"), text_style, text_color, FpsText));
+        });
+}
+
+fn update_fps_ui(
+    diagnostics: Res<DiagnosticsStore>,
+    mut fps_text: Query<&mut Text, With<FpsText>>,
+) {
+    let Ok(mut text) = fps_text.get_single_mut() else {
+        return;
+    };
+
+    let fps = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|diagnostic| diagnostic.smoothed())
+        .unwrap_or(0.0);
+
+    text.0 = format!("FPS: {fps:.0}");
+}
 
 fn brush(
     window: Query<&Window>,
@@ -298,6 +336,8 @@ impl Plugin for DebugPlugin {
             )
                 .run_if(in_state(GameState::Game)),
         )
+        .add_systems(Startup, spawn_fps_ui)
+        .add_systems(Update, update_fps_ui)
         .add_plugins(WorldInspectorPlugin::new())
         .add_plugins(RapierDebugRenderPlugin::default())
         //Frame on console

@@ -18,14 +18,19 @@ mod menu;
 mod particles;
 mod player;
 mod player_inv;
+mod prefabs;
 mod puffin_plugin;
 mod rigidbody;
+mod world_store;
+mod ui_fonts;
 mod prelude {
     pub use crate::GameState;
     pub use crate::{
         actors::*, animation::*, atom::*, camera::*, chunk::*, chunk_group::*, chunk_manager::*,
         consts::*, debug::*, geom_tools::*, manager_api::*, materials::*, menu::*, particles::*,
-        player::*, player_inv::*, puffin_plugin::*, rigidbody::*,
+        player::*, player_inv::*, prefabs::*, puffin_plugin::*, rigidbody::*,
+        world_store::*,
+        ui_fonts::*,
     };
     pub use bevy::input::mouse::MouseScrollUnit;
     pub use bevy::input::mouse::MouseWheel;
@@ -47,7 +52,6 @@ mod prelude {
     pub use bevy_rapier2d::prelude::*;
     pub use contour::ContourBuilder;
 
-    pub use crate::materials::Material;
     //pub use bevy_egui::EguiContext;
 
     pub use bevy_rapier2d::prelude::RigidBody as RapierRigidbody;
@@ -55,12 +59,21 @@ mod prelude {
 
 use prelude::*;
 
+use bevy::asset::AssetPlugin;
+
 fn main() {
     let args: Vec<_> = env::args().collect();
 
     let mut app = App::new();
 
-    app.add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
+    app.add_plugins(
+        DefaultPlugins
+            .set(ImagePlugin::default_nearest())
+            .set(AssetPlugin {
+                watch_for_changes_override: Some(false),
+                ..default()
+            }),
+    )
         //local plugins
         .add_plugins((
             ChunkManagerPlugin,
@@ -72,6 +85,8 @@ fn main() {
             CameraPlugin,
             RigidbodyPlugin,
             PlayerInvPlugin,
+            PrefabsPlugin,
+            QuaverFontPlugin,
         ))
         .add_plugins((
             RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(1.),

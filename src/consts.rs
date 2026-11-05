@@ -11,7 +11,7 @@ pub const QUARTER_CHUNK_LEN: usize = CHUNK_LEN / 4;
 
 // Actor consts
 
-pub const UP_WALK_HEIGHT: usize = 3;
+pub const UP_WALK_HEIGHT: usize = 5;
 
 // Player consts
 pub const FUEL_MAX: f32 = 50.;
@@ -29,7 +29,7 @@ pub const TOOL_DISTANCE: f32 = 32.;
 pub const TOOL_RANGE: f32 = 16.;
 
 pub const ZOOM_LOWER_BOUND: f32 = 0.15;
-pub const ZOOM_UPPER_BOUND: f32 = 0.30;
+pub const ZOOM_UPPER_BOUND: f32 = 4.0;
 
 pub const PLAYER_TERM_VEL: u8 = 20;
 
