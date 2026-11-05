@@ -298,17 +298,17 @@ pub fn spawn_numbers(
             if let Some(number) = slot.number {
                 let number_ent = commands
                     .spawn((
-                    Text::new(format!("{number}")),
-                    text_style.clone(),
-                    text_color,
-                    Node {
-                        position_type: PositionType::Absolute,
-                        right: Val::Px(2.0),
-                        bottom: Val::Px(2.0),
-                        ..default()
-                    },
-                    NumberUi(ent),
-                ))
+                        Text::new(format!("{number}")),
+                        text_style.clone(),
+                        text_color,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            right: Val::Px(2.0),
+                            bottom: Val::Px(2.0),
+                            ..default()
+                        },
+                        NumberUi(ent),
+                    ))
                     .id();
 
                 commands.entity(ent).add_child(number_ent);
@@ -324,15 +324,7 @@ pub fn spawn_numbers(
 pub fn update_numbers(
     mut commands: Commands,
     slots: Query<&ImageSlotUi, Without<NumberUi>>,
-    mut numbers: Query<
-        (
-            &NumberUi,
-            &mut Text,
-            Entity,
-            &mut Visibility,
-        ),
-        Without<ImageSlotUi>,
-    >,
+    mut numbers: Query<(&NumberUi, &mut Text, Entity, &mut Visibility), Without<ImageSlotUi>>,
     inventory: Res<Inventory>,
 ) {
     for (number_ui, mut text, ent, mut visibility) in numbers.iter_mut() {
@@ -447,17 +439,17 @@ pub fn item_events(
 
                         let number_ent = commands
                             .spawn((
-                            Text::new(format!("{number}")),
-                            text_style.clone(),
-                            text_color,
-                            Node {
-                                position_type: PositionType::Absolute,
-                                right: Val::Px(2.0),
-                                bottom: Val::Px(2.0),
-                                ..default()
-                            },
-                            NumberUi(image_ent),
-                        ))
+                                Text::new(format!("{number}")),
+                                text_style.clone(),
+                                text_color,
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    right: Val::Px(2.0),
+                                    bottom: Val::Px(2.0),
+                                    ..default()
+                                },
+                                NumberUi(image_ent),
+                            ))
                             .id();
 
                         commands.entity(image_ent).add_child(number_ent);

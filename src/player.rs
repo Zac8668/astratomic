@@ -257,8 +257,8 @@ pub fn update_player(
     }
 
     //Change shooting atoms
-    for i in 0..8 {
-        if inputs.numbers[i] {
+    for (i, &pressed) in inputs.numbers.iter().enumerate() {
+        if pressed {
             inventory.selected = i;
             break;
         }

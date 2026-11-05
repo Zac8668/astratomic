@@ -165,7 +165,7 @@ pub fn unfill_rigidbodies(
 
 pub fn image_values(image: &Image) -> Vec<f64> {
     let mut values = vec![];
-    for pixel in image.data.chunks_exact(4) {
+    for pixel in image.data.as_chunks::<4>().0 {
         if pixel[3] > 0 {
             values.push(1.)
         } else {
@@ -178,11 +178,11 @@ pub fn image_values(image: &Image) -> Vec<f64> {
 
 pub fn image_atoms(image: &Image) -> Vec<Atom> {
     let mut atoms = vec![];
-    for pixel in image.data.chunks_exact(4) {
+    for pixel in image.data.as_chunks::<4>().0 {
         if pixel[3] > 0 {
             atoms.push(Atom {
                 id: 8,
-                color: pixel.try_into().unwrap(),
+                color: *pixel,
                 ..Default::default()
             });
         } else {

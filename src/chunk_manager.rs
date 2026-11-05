@@ -66,15 +66,13 @@ impl ChunkManager {
         commands: &mut Commands,
         images: &mut ResMut<Assets<Image>>,
         dirty_rects: &mut DirtyRects,
-        prefab_placed: &mut PrefabPlaced,
-        pending_prefab_stamps: &mut PendingPrefabStamps,
-        prefab_configs: &PrefabConfigs,
-        chunk_textures: &Entity,
-        image_entities: &Query<(&Parent, Entity, &Sprite)>,
-        world_db: &sled::Db,
-        dir_materials: (MoveDir, &Materials, &Generator),
+        prefabs: (&mut PrefabPlaced, &mut PendingPrefabStamps, &PrefabConfigs),
+        entities: (&Entity, &Query<(&Parent, Entity, &Sprite)>),
+        world_info: (&sled::Db, MoveDir, &Materials, &Generator),
     ) {
-        let (move_dir, materials, generator) = dir_materials;
+        let (prefab_placed, pending_prefab_stamps, prefab_configs) = prefabs;
+        let (chunk_textures, image_entities) = entities;
+        let (world_db, move_dir, materials, generator) = world_info;
 
         let (for_load, vec_load, dir, y) = match move_dir {
             MoveDir::X(dir) => {
@@ -87,7 +85,7 @@ impl ChunkManager {
             }
         };
 
-    let seed = generator.2;
+        let seed = generator.2;
         let min_y = self.pos.y * CHUNK_LENGHT as i32;
         let max_y = (self.pos.y + LOAD_HEIGHT) * CHUNK_LENGHT as i32 - 1;
         let y_seed = (self.pos.y + LOAD_HEIGHT / 2) * CHUNK_LENGHT as i32;
@@ -150,13 +148,10 @@ impl ChunkManager {
                             let _ = stamp_prefab_at_x(
                                 self,
                                 dirty_rects,
-                                prefab_placed,
-                                pending_prefab_stamps,
+                                (prefab_placed, pending_prefab_stamps),
                                 materials,
-                                prefab_image,
-                                prefab_mask,
-                                x,
-                                y_seed,
+                                (prefab_image, prefab_mask),
+                                (x, y_seed),
                                 (min_y, max_y),
                             );
                         }
@@ -244,13 +239,16 @@ pub fn manager_setup(
     mut images: ResMut<Assets<Image>>,
     mut chunk_manager: ResMut<ChunkManager>,
     mut dirty_rects: ResMut<DirtyRects>,
-    mut prefab_placed: ResMut<PrefabPlaced>,
-    mut pending_prefab_stamps: ResMut<PendingPrefabStamps>,
+    prefabs: (
+        ResMut<PrefabPlaced>,
+        ResMut<PendingPrefabStamps>,
+        ResMut<PrefabConfigs>,
+    ),
     materials: (Res<Assets<Materials>>, ResMut<MaterialsHandle>),
-    mut generator: ResMut<Generator>,
-    mut prefab_configs: ResMut<PrefabConfigs>,
-    mut world_db: ResMut<WorldDb>,
+    world: (ResMut<Generator>, ResMut<WorldDb>),
 ) {
+    let (mut prefab_placed, mut pending_prefab_stamps, mut prefab_configs) = prefabs;
+    let (mut generator, mut world_db) = world;
     let (width, height) = (LOAD_WIDTH, LOAD_HEIGHT);
 
     let mut images_vec = vec![];
@@ -331,13 +329,10 @@ pub fn manager_setup(
                     let _ = stamp_prefab_at_x(
                         &mut chunk_manager,
                         &mut dirty_rects,
-                        &mut prefab_placed,
-                        &mut pending_prefab_stamps,
+                        (&mut prefab_placed, &mut pending_prefab_stamps),
                         materials,
-                        prefab_image,
-                        prefab_mask,
-                        x,
-                        y_seed,
+                        (prefab_image, prefab_mask),
+                        (x, y_seed),
                         (min_y, max_y),
                     );
                 }
@@ -519,7 +514,7 @@ pub fn chunk_manager_update(
         // Spawn a task on the deferred scope for handling the deferred dirty update rects.
         deferred_scope.spawn(async move {
             // Clear the new dirty rects so we can update a fresh list
-            *new_dirty_rects = HashMap::new();
+            new_dirty_rects.clear();
 
             // Loop through deferred tasks
             while let Ok(update) = dirty_update_rects_recv.recv().await {
@@ -542,7 +537,7 @@ pub fn chunk_manager_update(
         // Run the 4 update steps in checker like pattern
         for (y_toff, x_toff) in rand_range(0..2)
             .into_iter()
-            .cartesian_product(rand_range(0..2).into_iter())
+            .cartesian_product(rand_range(0..2))
         {
             puffin::profile_scope!("Update step scope.");
 
@@ -766,13 +761,13 @@ pub fn update_manager_pos(
                 &mut commands,
                 &mut images,
                 &mut dirty_rects,
-                &mut prefab_placed,
-                &mut pending_prefab_stamps,
-                &prefab_configs,
-                &chunk_textures,
-                &image_entities,
-                &db,
-                (MoveDir::X(diff.x.signum()), materials, &generator),
+                (
+                    &mut prefab_placed,
+                    &mut pending_prefab_stamps,
+                    &prefab_configs,
+                ),
+                (&chunk_textures, &image_entities),
+                (&db, MoveDir::X(diff.x.signum()), materials, &generator),
             );
             diff.x -= diff.x.signum();
         } else if diff.y != 0 {
@@ -780,13 +775,13 @@ pub fn update_manager_pos(
                 &mut commands,
                 &mut images,
                 &mut dirty_rects,
-                &mut prefab_placed,
-                &mut pending_prefab_stamps,
-                &prefab_configs,
-                &chunk_textures,
-                &image_entities,
-                &db,
-                (MoveDir::Y(diff.y.signum()), materials, &generator),
+                (
+                    &mut prefab_placed,
+                    &mut pending_prefab_stamps,
+                    &prefab_configs,
+                ),
+                (&chunk_textures, &image_entities),
+                (&db, MoveDir::Y(diff.y.signum()), materials, &generator),
             );
             diff.y -= diff.y.signum();
         }
@@ -899,9 +894,7 @@ fn flood_fill_blob_component(
     chunk_manager: &ChunkManager,
     start: IVec2,
 ) -> Option<BlobFloodResult> {
-    let Some(start_atom) = chunk_manager.get_atom(&global_to_chunk(start)) else {
-        return None;
-    };
+    let start_atom = chunk_manager.get_atom(&global_to_chunk(start))?;
     if !blobable(start_atom) {
         return None;
     }

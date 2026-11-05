@@ -34,7 +34,9 @@ pub fn db_has_any_chunks(db: &sled::Db) -> bool {
 }
 
 pub fn load_chunk_from_db(db: &sled::Db, pos: IVec2) -> Option<Chunk> {
-    db.get(chunk_key(pos)).unwrap().map(|ivec| decode_chunk(&ivec))
+    db.get(chunk_key(pos))
+        .unwrap()
+        .map(|ivec| decode_chunk(&ivec))
 }
 
 pub fn save_chunk_to_db(db: &sled::Db, pos: IVec2, chunk: &Chunk) {

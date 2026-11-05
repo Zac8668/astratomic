@@ -21,16 +21,15 @@ mod player_inv;
 mod prefabs;
 mod puffin_plugin;
 mod rigidbody;
-mod world_store;
 mod ui_fonts;
+mod world_store;
 mod prelude {
     pub use crate::GameState;
     pub use crate::{
         actors::*, animation::*, atom::*, camera::*, chunk::*, chunk_group::*, chunk_manager::*,
         consts::*, debug::*, geom_tools::*, manager_api::*, materials::*, menu::*, particles::*,
-        player::*, player_inv::*, prefabs::*, puffin_plugin::*, rigidbody::*,
+        player::*, player_inv::*, prefabs::*, puffin_plugin::*, rigidbody::*, ui_fonts::*,
         world_store::*,
-        ui_fonts::*,
     };
     pub use bevy::input::mouse::MouseScrollUnit;
     pub use bevy::input::mouse::MouseWheel;
@@ -74,26 +73,26 @@ fn main() {
                 ..default()
             }),
     )
-        //local plugins
-        .add_plugins((
-            ChunkManagerPlugin,
-            ActorsPlugin,
-            PlayerPlugin,
-            animation::AnimationPlugin,
-            ParticlesPlugin,
-            MaterialsPlugin,
-            CameraPlugin,
-            RigidbodyPlugin,
-            PlayerInvPlugin,
-            PrefabsPlugin,
-            QuaverFontPlugin,
-        ))
-        .add_plugins((
-            RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(1.),
-            MenuPlugin,
-        ))
-        .add_systems(Startup, setup)
-        .init_state::<GameState>();
+    //local plugins
+    .add_plugins((
+        ChunkManagerPlugin,
+        ActorsPlugin,
+        PlayerPlugin,
+        animation::AnimationPlugin,
+        ParticlesPlugin,
+        MaterialsPlugin,
+        CameraPlugin,
+        RigidbodyPlugin,
+        PlayerInvPlugin,
+        PrefabsPlugin,
+        QuaverFontPlugin,
+    ))
+    .add_plugins((
+        RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(1.),
+        MenuPlugin,
+    ))
+    .add_systems(Startup, setup)
+    .init_state::<GameState>();
 
     if args.contains(&"-d".to_string()) || args.contains(&"--debug".to_string()) {
         app.add_plugins((DebugPlugin,));

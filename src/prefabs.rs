@@ -110,7 +110,11 @@ pub struct PrefabPlaced {
 
 impl PrefabPlaced {
     fn insert_range_merged(&mut self, start: i32, end: i32) {
-        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
 
         self.x_ranges.push((start, end));
         self.x_ranges.sort_unstable_by_key(|&(s, _)| s);
@@ -310,13 +314,10 @@ pub fn apply_pending_stamps_for_chunk(
 pub fn stamp_prefab_at_x(
     chunk_manager: &mut ChunkManager,
     dirty_rects: &mut DirtyRects,
-    prefab_placed: &mut PrefabPlaced,
-    pending: &mut PendingPrefabStamps,
+    (prefab_placed, pending): (&mut PrefabPlaced, &mut PendingPrefabStamps),
     materials: &Materials,
-    prefab_image: &Image,
-    prefab_mask: &Image,
-    x: i32,
-    y_seed: i32,
+    (prefab_image, prefab_mask): (&Image, &Image),
+    (x, y_seed): (i32, i32),
     bounds_y: (i32, i32),
 ) -> bool {
     let (min_y, max_y) = bounds_y;
@@ -407,12 +408,12 @@ fn get_random_at(seed: u32, x: i32) -> f32 {
     use std::num::Wrapping;
 
     let mut n = Wrapping(x as u32);
-    n = n * Wrapping(0xB5297A4D);
-    n = n + Wrapping(seed);
+    n *= Wrapping(0xB5297A4D);
+    n += Wrapping(seed);
     n = n ^ (n >> 8);
-    n = n + Wrapping(0x68E31DA4);
+    n += Wrapping(0x68E31DA4);
     n = n ^ (n << 8);
-    n = n * Wrapping(0x1B56C4E9);
+    n *= Wrapping(0x1B56C4E9);
     n = n ^ (n >> 8);
 
     // Convert huge integer to float 0.0 - 1.0

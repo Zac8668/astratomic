@@ -52,16 +52,15 @@ fn brush(
 ) {
     let materials = materials.0.get(&materials.1 .0).unwrap();
 
-    let atom;
-    if input.0.pressed(MouseButton::Middle) {
-        atom = Atom::new(2, materials);
+    let atom = if input.0.pressed(MouseButton::Middle) {
+        Atom::new(2, materials)
     } else if input.1.pressed(KeyCode::ControlLeft) {
-        atom = Atom::new(3, materials);
+        Atom::new(3, materials)
     } else if input.1.pressed(KeyCode::ShiftLeft) {
-        atom = Atom::new(8, materials);
+        Atom::new(8, materials)
     } else {
         return;
-    }
+    };
 
     let (camera, camera_transform) = camera_q.single();
     let window = window.single();
