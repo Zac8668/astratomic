@@ -257,8 +257,8 @@ pub fn update_player(
     }
 
     //Change shooting atoms
-    for i in 0..8 {
-        if inputs.numbers[i] {
+    for (i, &pressed) in inputs.numbers.iter().enumerate() {
+        if pressed {
             inventory.selected = i;
             break;
         }
@@ -373,6 +373,7 @@ pub enum ButtonType {
 
 pub fn dead(
     mut commands: Commands,
+    quaver_font: Res<QuaverFont>,
     mut player: Query<(&mut Player, &mut Life, &mut Actor)>,
     respawn_ui: Query<Entity, With<RespawnUI>>,
     mut interaction_query: Query<
@@ -390,6 +391,7 @@ pub fn dead(
     if !matches!(player.state, PlayerState::Dead) {
         return;
     } else if respawn_ui.is_empty() {
+        let quaver_font: Handle<Font> = quaver_font.0.clone();
         //Spawn UI
         let button_style = Node {
             width: Val::Px(180.0),
@@ -411,6 +413,7 @@ pub fn dead(
         };
 
         let text_style = TextFont {
+            font: quaver_font,
             font_size: 20.0,
             ..Default::default()
         };
@@ -491,6 +494,7 @@ pub fn tool_system(
     resources: (
         ResMut<ChunkManager>,
         ResMut<DirtyRects>,
+        ResMut<BrokenAtoms>,
         Res<Inputs>,
         Res<Inventory>,
         Res<Assets<Materials>>,
@@ -502,8 +506,15 @@ pub fn tool_system(
     let (camera, camera_gtransform) = camera.single_mut();
     let (window, mut player) = querys;
     let (mut textatlas_sprite, player) = player.single_mut();
-    let (mut chunk_manager, mut dirty_rects, inputs, inventory, materials, materials_handle) =
-        resources;
+    let (
+        mut chunk_manager,
+        mut dirty_rects,
+        mut broken_atoms,
+        inputs,
+        inventory,
+        materials,
+        materials_handle,
+    ) = resources;
     let Ok(window) = window.get_single() else {
         return;
     };
@@ -641,6 +652,10 @@ pub fn tool_system(
                             state: PartState::Follow(tool_front_ent.single()),
                             ..Default::default()
                         });
+
+                        if atom.is_solid() {
+                            broken_atoms.0.insert(vec);
+                        }
 
                         pos_to_update.push(chunk_pos);
                         *atom = Atom::default();

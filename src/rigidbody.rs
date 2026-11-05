@@ -2,14 +2,18 @@ use crate::prelude::*;
 use geo::{SimplifyVwPreserve, TriangulateEarcut};
 use itertools::Itertools;
 
-#[derive(Component)]
+#[derive(Component, Default)]
 pub struct Rigidbody {
     pub atoms: Vec<Atom>,
     pub width: u8,
     pub height: u8,
     // Positions to remove Object atom later
     pub filled: Vec<ChunkPos>,
+    pub _despawn: DespawnOptions,
 }
+
+#[derive(Default)]
+pub struct DespawnOptions {}
 
 #[derive(Component, Default)]
 pub struct RigidbodyHandle(Handle<Image>, Vec2);
@@ -19,7 +23,7 @@ pub struct Hydrated;
 
 //TODO Add rigidbody file
 pub fn _load_images(mut commands: Commands, server: Res<AssetServer>) {
-    let image: Handle<Image> = server.load("tree.png");
+    let image: Handle<Image> = server.load("prefabs/tree/image.png");
     commands.spawn(RigidbodyHandle(image.clone(), vec2(64., -64.)));
 
     let image: Handle<Image> = server.load("player/player_tool.png");
@@ -43,6 +47,7 @@ pub fn add_rigidbodies(
             height: image.height() as u8,
             width: image.width() as u8,
             filled: vec![],
+            ..Default::default()
         };
 
         let collider = get_collider(&image_values(image), image.width(), image.height()).unwrap();
@@ -160,7 +165,7 @@ pub fn unfill_rigidbodies(
 
 pub fn image_values(image: &Image) -> Vec<f64> {
     let mut values = vec![];
-    for pixel in image.data.chunks_exact(4) {
+    for pixel in image.data.as_chunks::<4>().0 {
         if pixel[3] > 0 {
             values.push(1.)
         } else {
@@ -173,11 +178,11 @@ pub fn image_values(image: &Image) -> Vec<f64> {
 
 pub fn image_atoms(image: &Image) -> Vec<Atom> {
     let mut atoms = vec![];
-    for pixel in image.data.chunks_exact(4) {
+    for pixel in image.data.as_chunks::<4>().0 {
         if pixel[3] > 0 {
             atoms.push(Atom {
                 id: 8,
-                color: pixel.try_into().unwrap(),
+                color: *pixel,
                 ..Default::default()
             });
         } else {
@@ -218,7 +223,7 @@ pub fn get_collider(values: &[f64], width: u32, height: u32) -> Option<Collider>
 pub struct RigidbodyPlugin;
 impl Plugin for RigidbodyPlugin {
     fn build(&self, app: &mut App) {
-        app //.add_systems(Startup, load_images)
+        app.add_systems(Startup, _load_images)
             .add_systems(Update, add_rigidbodies.run_if(in_state(GameState::Game)))
             .add_systems(
                 FixedUpdate,

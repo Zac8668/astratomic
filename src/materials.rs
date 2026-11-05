@@ -94,12 +94,27 @@ pub fn materials_setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.insert_resource(MaterialsHandle(handle));
 }
 
-pub fn materials_wait(
+pub fn loading_wait(
     asset_server: Res<AssetServer>,
     materials: Res<MaterialsHandle>,
     mut next_state: ResMut<NextState<GameState>>,
+    prefab_configs: Res<PrefabConfigs>,
 ) {
-    if asset_server.is_loaded(&materials.0) {
+    // Wait for materials, prefab images, and masks
+    let mut all_loaded = asset_server.is_loaded(&materials.0);
+    if all_loaded {
+        for prefab in &prefab_configs.0 {
+            let image_state = asset_server.get_load_state(&prefab.image);
+            let mask_state = asset_server.get_load_state(&prefab.mask);
+            if !matches!(image_state, Some(bevy::asset::LoadState::Loaded))
+                || !matches!(mask_state, Some(bevy::asset::LoadState::Loaded))
+            {
+                all_loaded = false;
+                break;
+            }
+        }
+    }
+    if all_loaded {
         next_state.set(GameState::Game);
     }
 }
@@ -111,6 +126,6 @@ impl Plugin for MaterialsPlugin {
             .init_resource::<MaterialsHandle>()
             .init_asset_loader::<MaterialsLoader>()
             .add_systems(OnEnter(GameState::Loading), materials_setup)
-            .add_systems(Update, materials_wait.run_if(in_state(GameState::Loading)));
+            .add_systems(Update, loading_wait.run_if(in_state(GameState::Loading)));
     }
 }

@@ -234,10 +234,26 @@ pub fn inv_setup(
                                 TextureDimension::D2,
                                 data,
                                 TextureFormat::Rgba8UnormSrgb,
-                                RenderAssetUsages::RENDER_WORLD,
+                                RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
                             ))
                         }
                         Item::SmartTool => asset_server.load("player/player_tool.png"),
+                    };
+
+                    let image_node_style = match slot.item {
+                        // Procedural icons are square; fill the slot.
+                        Item::Atom(_) => Node {
+                            width: Val::Percent(100.),
+                            height: Val::Percent(100.),
+                            ..Default::default()
+                        },
+                        // Keep the PNG aspect ratio (8x6 => 4/3).
+                        Item::SmartTool => Node {
+                            width: Val::Percent(100.),
+                            height: Val::Auto,
+                            aspect_ratio: Some(4.0 / 3.0),
+                            ..Default::default()
+                        },
                     };
 
                     parent.with_child((
@@ -245,10 +261,7 @@ pub fn inv_setup(
                             image,
                             ..Default::default()
                         },
-                        Node {
-                            width: Val::Percent(100.),
-                            ..Default::default()
-                        },
+                        image_node_style,
                         ImageSlotUi(i, parent.id()),
                     ));
                 }
@@ -268,10 +281,13 @@ pub struct NumberUi(pub Entity);
 
 pub fn spawn_numbers(
     mut commands: Commands,
+    quaver_font: Res<QuaverFont>,
     slots: Query<(&ImageSlotUi, Entity)>,
     inventory: Res<Inventory>,
 ) {
+    let quaver_font: Handle<Font> = quaver_font.0.clone();
     let text_style = TextFont {
+        font: quaver_font,
         font_size: 11.,
         ..Default::default()
     };
@@ -280,16 +296,25 @@ pub fn spawn_numbers(
     for (index, ent) in slots.iter() {
         if let Some(slot) = inventory.slots[index.0] {
             if let Some(number) = slot.number {
-                let mut ent = commands.spawn((
-                    Text::new(format!("{number}")),
-                    text_style.clone(),
-                    text_color,
-                    Node::DEFAULT,
-                    Transform::from_xyz(0., 0., 100000.),
-                    NumberUi(ent),
-                ));
+                let number_ent = commands
+                    .spawn((
+                        Text::new(format!("{number}")),
+                        text_style.clone(),
+                        text_color,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            right: Val::Px(2.0),
+                            bottom: Val::Px(2.0),
+                            ..default()
+                        },
+                        NumberUi(ent),
+                    ))
+                    .id();
+
+                commands.entity(ent).add_child(number_ent);
+
                 if index.0 >= 8 {
-                    ent.insert(Visibility::Hidden);
+                    commands.entity(number_ent).insert(Visibility::Hidden);
                 }
             }
         }
@@ -298,21 +323,12 @@ pub fn spawn_numbers(
 
 pub fn update_numbers(
     mut commands: Commands,
-    slots: Query<(&ImageSlotUi, &GlobalTransform), Without<NumberUi>>,
-    mut numbers: Query<
-        (
-            &mut GlobalTransform,
-            &NumberUi,
-            &mut Text,
-            Entity,
-            &mut Visibility,
-        ),
-        Without<ImageSlotUi>,
-    >,
+    slots: Query<&ImageSlotUi, Without<NumberUi>>,
+    mut numbers: Query<(&NumberUi, &mut Text, Entity, &mut Visibility), Without<ImageSlotUi>>,
     inventory: Res<Inventory>,
 ) {
-    for (mut gtransform, number_ui, mut text, ent, mut visibility) in numbers.iter_mut() {
-        if let Ok((slot, slot_gtransform)) = slots.get(number_ui.0) {
+    for (number_ui, mut text, ent, mut visibility) in numbers.iter_mut() {
+        if let Ok(slot) = slots.get(number_ui.0) {
             if slot.0 >= 8 && !inventory.showing {
                 *visibility = Visibility::Hidden;
             } else if slot.0 < 8 || inventory.showing {
@@ -320,9 +336,11 @@ pub fn update_numbers(
             }
 
             if let Some(slot) = inventory.slots[slot.0] {
-                text.0 = slot.number.unwrap().to_string();
-                let v = slot_gtransform.clone().translation() + Vec3::new(0., 28.5, 500.);
-                *gtransform = GlobalTransform::from_xyz(v.x, v.y, v.z);
+                if let Some(n) = slot.number {
+                    text.0 = n.to_string();
+                } else {
+                    commands.entity(ent).despawn_recursive();
+                }
             } else {
                 commands.entity(ent).despawn_recursive();
             }
@@ -346,9 +364,11 @@ pub fn item_events(
     mut inv: ResMut<Inventory>,
     mut images: ResMut<Assets<Image>>,
     asset_server: Res<AssetServer>,
+    quaver_font: Res<QuaverFont>,
     materials: (Res<Assets<Materials>>, Res<MaterialsHandle>),
 ) {
     let materials = materials.0.get(&materials.1 .0).unwrap();
+    let quaver_font: Handle<Font> = quaver_font.0.clone();
 
     for ev in ev_items.read() {
         match ev {
@@ -375,10 +395,24 @@ pub fn item_events(
                                 TextureDimension::D2,
                                 data,
                                 TextureFormat::Rgba8UnormSrgb,
-                                RenderAssetUsages::RENDER_WORLD,
+                                RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
                             ))
                         }
                         Item::SmartTool => asset_server.load("player/player_tool.png"),
+                    };
+
+                    let image_node_style = match item {
+                        Item::Atom(_) => Node {
+                            width: Val::Percent(100.),
+                            height: Val::Percent(100.),
+                            ..Default::default()
+                        },
+                        Item::SmartTool => Node {
+                            width: Val::Percent(100.),
+                            height: Val::Auto,
+                            aspect_ratio: Some(4.0 / 3.0),
+                            ..Default::default()
+                        },
                     };
 
                     let image_ent = commands
@@ -387,10 +421,7 @@ pub fn item_events(
                                 image,
                                 ..Default::default()
                             },
-                            Node {
-                                width: Val::Percent(100.),
-                                ..Default::default()
-                            },
+                            image_node_style,
                             ImageSlotUi(index, ent),
                         ))
                         .id();
@@ -400,23 +431,33 @@ pub fn item_events(
                     let slot = inv.slots[index].unwrap();
                     if let Some(number) = slot.number {
                         let text_style = TextFont {
+                            font: quaver_font.clone(),
                             font_size: 11.,
                             ..Default::default()
                         };
                         let text_color = TextColor(Color::srgb(0.9, 0.9, 0.9));
 
-                        let mut ent = commands.spawn((
-                            Text::new(format!("{number}")),
-                            text_style.clone(),
-                            text_color,
-                            Node::DEFAULT,
-                            Transform::from_xyz(0., 0., 10.),
-                            NumberUi(image_ent),
-                        ));
+                        let number_ent = commands
+                            .spawn((
+                                Text::new(format!("{number}")),
+                                text_style.clone(),
+                                text_color,
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    right: Val::Px(2.0),
+                                    bottom: Val::Px(2.0),
+                                    ..default()
+                                },
+                                NumberUi(image_ent),
+                            ))
+                            .id();
+
+                        commands.entity(image_ent).add_child(number_ent);
+
                         if !inv.showing && index >= 8 {
-                            ent.insert(Visibility::Hidden);
+                            commands.entity(number_ent).insert(Visibility::Hidden);
                         } else if inv.showing || index < 8 {
-                            ent.insert(Visibility::Visible);
+                            commands.entity(number_ent).insert(Visibility::Visible);
                         }
                     }
                 }

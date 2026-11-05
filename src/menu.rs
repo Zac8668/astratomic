@@ -13,8 +13,13 @@ enum ButtonType {
 #[derive(Component)]
 pub struct Background(pub Handle<Image>);
 
-fn spawn_menu_buttons(mut commands: Commands, asset_server: Res<AssetServer>) {
+fn spawn_menu_buttons(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    quaver_font: Res<QuaverFont>,
+) {
     let background = asset_server.load("images/menu_background.png");
+    let quaver_font: Handle<Font> = quaver_font.0.clone();
 
     commands.spawn((
         Sprite::from(background.clone()),
@@ -42,6 +47,7 @@ fn spawn_menu_buttons(mut commands: Commands, asset_server: Res<AssetServer>) {
     };
 
     let text_style = TextFont {
+        font: quaver_font.clone(),
         font_size: 40.0,
         ..Default::default()
     };
@@ -51,6 +57,17 @@ fn spawn_menu_buttons(mut commands: Commands, asset_server: Res<AssetServer>) {
         .spawn(ui_style)
         .insert(MenuUI)
         .with_children(|parent| {
+            let title_style = TextFont {
+                font: quaver_font.clone(),
+                font_size: 160.0,
+                ..Default::default()
+            };
+            parent.spawn((
+                Text::new("astratomic"),
+                title_style,
+                TextColor(Color::WHITE),
+            ));
+
             //Start
             parent
                 .spawn((Button, button_style.clone()))

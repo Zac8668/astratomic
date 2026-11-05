@@ -7,7 +7,7 @@ license     = "PolyForm NonCommercial v1.0"
 default-run = "astratomic"
 
 [dependencies]
-bevy                = {version = "0.15", features =["file_watcher"]}
+bevy                = {version = "0.15.3", features =["file_watcher"]}
 bevy-inspector-egui = "0.28.1"
 rand                = { version = "0.9", features = ["small_rng"] }
 fastrand            = "2.0"
@@ -22,18 +22,17 @@ serde-big-array     = "0.5"
 ron                 = "0.8"
 bevy_async_task = "0.4.0"
 
+sled = "0.34"
+zstd = "0.13"
+
 contour = "0.13"
 bevy_rapier2d = { version = "0.28", features = [ "simd-stable", "debug-render-2d", "parallel" ] }
 geo = "0.29"
-rotsprite = "0.1"
 
 puffin              = "0.19"
 
 thiserror = "2.0"
 noise = "0.9.0"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-bevy_dylib = "0.15"
 
 # Optimize dependencies even in development
 [profile.dev.package."*"]

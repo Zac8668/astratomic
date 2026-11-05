@@ -130,7 +130,7 @@ impl Chunk {
     }
 
     //This uses the CPU and is not used in-game anymore
-    pub fn update_image_positions(&self, image: &mut Image, positions: &HashSet<IVec2>) {
+    pub fn _update_image_positions(&self, image: &mut Image, positions: &HashSet<IVec2>) {
         for pos in positions {
             let pixel_index = (pos.y as usize * CHUNK_LENGHT + pos.x as usize) * 4;
             image.data[pixel_index..pixel_index + 4].copy_from_slice(&self.atoms[pos.d1()].color);
@@ -138,11 +138,18 @@ impl Chunk {
     }
 
     pub fn update_all(&self, image: &mut Image) {
-        let positions: HashSet<IVec2> = (0..CHUNK_LENGHT)
-            .flat_map(|y| (0..CHUNK_LENGHT).map(move |x| IVec2::new(x as i32, y as i32)))
-            .collect();
+        // Hot path: initializing a whole chunk texture during load.
+        // Avoid allocating/iterating a HashSet of every position.
+        debug_assert_eq!(image.data.len(), CHUNK_LENGHT * CHUNK_LENGHT * 4);
 
-        self.update_image_positions(image, &positions)
+        for y in 0..CHUNK_LENGHT {
+            for x in 0..CHUNK_LENGHT {
+                let atom_index = y * CHUNK_LENGHT + x;
+                let pixel_index = atom_index * 4;
+                image.data[pixel_index..pixel_index + 4]
+                    .copy_from_slice(&self.atoms[atom_index].color);
+            }
+        }
     }
 
     pub fn get_collider(&self) -> Option<Collider> {

@@ -5,6 +5,7 @@ use rand::Rng;
 
 use async_channel::Sender;
 
+use crate::materials::Material;
 use crate::prelude::*;
 
 pub struct UpdateChunksType<'a> {

@@ -1,7 +1,9 @@
-use std::task::Poll;
+use std::collections::VecDeque;
 
-use bevy::render::render_asset::{RenderAssetDependency, RenderAssets};
-use bevy::render::render_resource::{Extent3d, ImageCopyTexture, ImageDataLayout, Origin3d};
+use bevy::render::render_asset::{RenderAssetDependency, RenderAssetUsages, RenderAssets};
+use bevy::render::render_resource::{
+    Extent3d, ImageCopyTexture, ImageDataLayout, Origin3d, TextureDimension, TextureFormat,
+};
 use bevy::render::renderer::RenderQueue;
 use bevy::render::texture::GpuImage;
 use bevy::render::{Extract, RenderApp, RenderSet};
@@ -12,6 +14,19 @@ use smallvec::SmallVec;
 use noise::{MultiFractal, RidgedMulti, SuperSimplex};
 
 use crate::prelude::*;
+
+#[derive(Resource, Default)]
+pub struct WorldDb(pub Option<sled::Db>);
+
+impl WorldDb {
+    fn get_or_open(&mut self) -> &sled::Db {
+        if self.0.is_none() {
+            let db = open_world_db();
+            self.0 = Some(db);
+        }
+        self.0.as_ref().unwrap()
+    }
+}
 
 /// Updates and do the chunks logic
 #[derive(Default, Resource)]
@@ -50,12 +65,14 @@ impl ChunkManager {
         &mut self,
         commands: &mut Commands,
         images: &mut ResMut<Assets<Image>>,
-        chunk_textures: &Entity,
-        image_entities: &Query<(&Parent, Entity, &Sprite)>,
-        file_chunks: &mut HashMap<IVec2, Chunk>,
-        dir_materials: (MoveDir, &Materials, &Generator),
+        dirty_rects: &mut DirtyRects,
+        prefabs: (&mut PrefabPlaced, &mut PendingPrefabStamps, &PrefabConfigs),
+        entities: (&Entity, &Query<(&Parent, Entity, &Sprite)>),
+        world_info: (&sled::Db, MoveDir, &Materials, &Generator),
     ) {
-        let (move_dir, materials, generator) = dir_materials;
+        let (prefab_placed, pending_prefab_stamps, prefab_configs) = prefabs;
+        let (chunk_textures, image_entities) = entities;
+        let (world_db, move_dir, materials, generator) = world_info;
 
         let (for_load, vec_load, dir, y) = match move_dir {
             MoveDir::X(dir) => {
@@ -67,6 +84,11 @@ impl ChunkManager {
                 (LOAD_WIDTH, LOAD_HEIGHT, dir, true)
             }
         };
+
+        let seed = generator.2;
+        let min_y = self.pos.y * CHUNK_LENGHT as i32;
+        let max_y = (self.pos.y + LOAD_HEIGHT) * CHUNK_LENGHT as i32 - 1;
+        let y_seed = (self.pos.y + LOAD_HEIGHT / 2) * CHUNK_LENGHT as i32;
 
         let mut images_vec = vec![];
         let mut to_remove = vec![];
@@ -83,11 +105,7 @@ impl ChunkManager {
                 to_remove.push(changed_chunk.texture.clone());
                 images.remove(&changed_chunk.texture);
 
-                if let Some(chunk) = file_chunks.get_mut(&pos) {
-                    *chunk = changed_chunk;
-                } else {
-                    file_chunks.insert(pos, changed_chunk);
-                }
+                save_chunk_to_db(world_db, pos, &changed_chunk);
             }
 
             {
@@ -98,13 +116,51 @@ impl ChunkManager {
                 }
                 let pos = self.pos + to_add;
 
-                let chunk = if let Some(file_chunk) = file_chunks.get(&pos) {
-                    file_chunk.clone()
+                let from_file = load_chunk_from_db(world_db, pos).is_some();
+                let chunk = if let Some(file_chunk) = load_chunk_from_db(world_db, pos) {
+                    file_chunk
                 } else {
                     Chunk::new(Handle::default(), pos, materials, generator)
                 };
 
-                images_vec.push(add_chunk(commands, images, self, chunk, pos));
+                self.add_chunk(pos, chunk);
+
+                // If any previously queued prefab pixels target this chunk, apply them now.
+                apply_pending_stamps_for_chunk(
+                    self,
+                    dirty_rects,
+                    materials,
+                    pending_prefab_stamps,
+                    pos,
+                );
+
+                // Spawn prefabs only for freshly generated chunks.
+                if !from_file {
+                    let images_ref: &Assets<Image> = &*images;
+                    for config in &prefab_configs.0 {
+                        let Some((prefab_image, prefab_mask)) = prefab_images(images_ref, config)
+                        else {
+                            continue;
+                        };
+
+                        let xs = prefab_xs_for_chunk(config, pos.x, seed);
+                        for x in xs {
+                            let _ = stamp_prefab_at_x(
+                                self,
+                                dirty_rects,
+                                (prefab_placed, pending_prefab_stamps),
+                                materials,
+                                (prefab_image, prefab_mask),
+                                (x, y_seed),
+                                (min_y, max_y),
+                            );
+                        }
+                    }
+                }
+
+                if let Some(chunk) = self.chunks.get_mut(&pos) {
+                    images_vec.push(add_chunk_image(commands, images, chunk, pos));
+                }
             }
         }
 
@@ -116,26 +172,9 @@ impl ChunkManager {
         let mut chunk_textures = commands.get_entity(*chunk_textures).unwrap();
         chunk_textures.insert_children(0, &images_vec);
     }
-}
 
-impl Drop for ChunkManager {
-    fn drop(&mut self) {
-        let file = File::open("assets/world/world").unwrap();
-        let mut buffered = BufReader::new(file);
-        let mut file_chunks: HashMap<IVec2, Chunk> =
-            bincode::deserialize_from(&mut buffered).unwrap();
-
-        for (pos, chunk) in &self.chunks {
-            if let Some(file_chunk) = file_chunks.get_mut(pos) {
-                *file_chunk = chunk.clone();
-            } else {
-                file_chunks.insert(*pos, chunk.clone());
-            }
-        }
-
-        let file = File::create("assets/world/world").unwrap();
-        let mut buffered = BufWriter::new(file);
-        bincode::serialize_into(&mut buffered, &file_chunks).unwrap();
+    pub fn add_chunk(&mut self, index: IVec2, chunk: Chunk) {
+        self.chunks.insert(index, chunk);
     }
 }
 
@@ -151,6 +190,26 @@ impl std::ops::IndexMut<ChunkPos> for ChunkManager {
     fn index_mut(&mut self, pos: ChunkPos) -> &mut Self::Output {
         self.get_mut_atom(pos).expect("Invalid index position.")
     }
+}
+
+fn save_chunks_on_exit(
+    mut exit_events: EventReader<AppExit>,
+    chunk_manager: Res<ChunkManager>,
+    world_db: ResMut<WorldDb>,
+) {
+    if exit_events.read().next().is_none() {
+        return;
+    }
+
+    let Some(db) = world_db.0.as_ref() else {
+        return;
+    };
+
+    for (pos, chunk) in &chunk_manager.chunks {
+        save_chunk_to_db(db, *pos, chunk);
+    }
+
+    let _ = db.flush();
 }
 
 #[derive(Resource, Default)]
@@ -179,24 +238,28 @@ pub fn manager_setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     mut chunk_manager: ResMut<ChunkManager>,
+    mut dirty_rects: ResMut<DirtyRects>,
+    prefabs: (
+        ResMut<PrefabPlaced>,
+        ResMut<PendingPrefabStamps>,
+        ResMut<PrefabConfigs>,
+    ),
     materials: (Res<Assets<Materials>>, ResMut<MaterialsHandle>),
-    mut generator: ResMut<Generator>,
+    world: (ResMut<Generator>, ResMut<WorldDb>),
 ) {
+    let (mut prefab_placed, mut pending_prefab_stamps, mut prefab_configs) = prefabs;
+    let (mut generator, mut world_db) = world;
     let (width, height) = (LOAD_WIDTH, LOAD_HEIGHT);
 
     let mut images_vec = vec![];
     chunk_manager.pos = ivec2(-16, -16);
 
-    let file_chunks: HashMap<IVec2, Chunk>;
-    if let Ok(file) = File::open("assets/world/world") {
-        let mut buffered = BufReader::new(file);
-        file_chunks = bincode::deserialize_from(&mut buffered).unwrap();
-    } else {
-        file_chunks = HashMap::new();
-        let file = File::create("assets/world/world").unwrap();
-        let mut buffered = BufWriter::new(file);
-        bincode::serialize_into(&mut buffered, &file_chunks).unwrap();
-    }
+    // Reset placed-prefab registry on fresh setup.
+    prefab_placed.x_ranges.clear();
+    pending_prefab_stamps.0.clear();
+
+    let db = world_db.get_or_open();
+    let is_new_world = !db_has_any_chunks(db);
 
     let bytes = std::fs::read("assets/gen.ron").unwrap();
     let gen_config = ron::de::from_bytes::<[f64; 6]>(&bytes).unwrap();
@@ -207,21 +270,86 @@ pub fn manager_setup(
         .set_persistence(gen_config[3])
         .set_attenuation(gen_config[4]);
     generator.1 = gen_config[0];
+    //Seed
     generator.2 = gen_config[5] as u32;
 
+    //Get materials (already loaded at this point).
+    let materials = materials.0.get(&materials.1 .0).unwrap();
+
+    // Adds chunks
     for (x, y) in (chunk_manager.pos.x..chunk_manager.pos.x + width)
         .cartesian_product(chunk_manager.pos.y..chunk_manager.pos.y + height)
     {
         let index = ivec2(x, y);
         let chunk;
-        if let Some(file_chunk) = file_chunks.get(&index) {
-            chunk = file_chunk.clone();
+        if let Some(file_chunk) = load_chunk_from_db(db, index) {
+            chunk = file_chunk;
         } else {
-            let materials = materials.0.get(&materials.1 .0).unwrap();
             chunk = Chunk::new(Handle::default(), index, materials, &generator);
         }
 
-        let ent = add_chunk(&mut commands, &mut images, &mut chunk_manager, chunk, index);
+        chunk_manager.add_chunk(index, chunk);
+    }
+
+    if is_new_world {
+        // Adds prefabs on a new world only.
+        // Clear positions before accumulating
+        for config in &mut prefab_configs.0 {
+            config.positions.clear();
+        }
+
+        for x in chunk_manager.pos.x..(chunk_manager.pos.x + width) {
+            for config in &mut prefab_configs.0 {
+                config
+                    .positions
+                    .extend(prefab_xs_for_chunk(&*config, x, gen_config[5] as u32));
+            }
+        }
+
+        // Stable + deduped x positions per prefab type.
+        for config in &mut prefab_configs.0 {
+            config.positions.sort_unstable();
+            config.positions.dedup();
+        }
+
+        // Stamp prefabs into the world, aligned to the nearest surface.
+        // We seed the y-search from the middle of the currently loaded vertical range.
+        {
+            let images_ref: &Assets<Image> = &images;
+            let min_y = chunk_manager.pos.y * CHUNK_LENGHT as i32;
+            let max_y = (chunk_manager.pos.y + height) * CHUNK_LENGHT as i32 - 1;
+            let y_seed = (chunk_manager.pos.y + height / 2) * CHUNK_LENGHT as i32;
+
+            for config in &prefab_configs.0 {
+                let Some((prefab_image, prefab_mask)) = prefab_images(images_ref, config) else {
+                    continue;
+                };
+
+                for &x in &config.positions {
+                    let _ = stamp_prefab_at_x(
+                        &mut chunk_manager,
+                        &mut dirty_rects,
+                        (&mut prefab_placed, &mut pending_prefab_stamps),
+                        materials,
+                        (prefab_image, prefab_mask),
+                        (x, y_seed),
+                        (min_y, max_y),
+                    );
+                }
+            }
+        }
+    }
+
+    //Add Chunk images
+    for (x, y) in (chunk_manager.pos.x..chunk_manager.pos.x + width)
+        .cartesian_product(chunk_manager.pos.y..chunk_manager.pos.y + height)
+    {
+        let index = ivec2(x, y);
+
+        let Some(chunk) = chunk_manager.chunks.get_mut(&index) else {
+            continue;
+        };
+        let ent = add_chunk_image(&mut commands, &mut images, chunk, index);
         images_vec.push(ent);
     }
 
@@ -386,7 +514,7 @@ pub fn chunk_manager_update(
         // Spawn a task on the deferred scope for handling the deferred dirty update rects.
         deferred_scope.spawn(async move {
             // Clear the new dirty rects so we can update a fresh list
-            *new_dirty_rects = HashMap::new();
+            new_dirty_rects.clear();
 
             // Loop through deferred tasks
             while let Ok(update) = dirty_update_rects_recv.recv().await {
@@ -409,7 +537,7 @@ pub fn chunk_manager_update(
         // Run the 4 update steps in checker like pattern
         for (y_toff, x_toff) in rand_range(0..2)
             .into_iter()
-            .cartesian_product(rand_range(0..2).into_iter())
+            .cartesian_product(rand_range(0..2))
         {
             puffin::profile_scope!("Update step scope.");
 
@@ -515,11 +643,10 @@ pub fn update_chunks(chunks: &mut UpdateChunksType, dt: u8, dirty_rect: &URect) 
 pub struct ChunkComponent(pub IVec2);
 
 //Still needs to add the return entity to a parent
-pub fn add_chunk(
+pub fn add_chunk_image(
     commands: &mut Commands,
     images: &mut ResMut<Assets<Image>>,
-    chunk_manager: &mut ChunkManager,
-    mut chunk: Chunk,
+    chunk: &mut Chunk,
     index: IVec2,
 ) -> Entity {
     let pos = Vec2::new(
@@ -551,7 +678,6 @@ pub fn add_chunk(
         .id();
     chunk.entity = Some(entity);
 
-    chunk_manager.chunks.insert(index, chunk);
     entity
 }
 
@@ -565,13 +691,29 @@ pub fn update_manager_pos(
         ResMut<ChunkManager>,
         ResMut<Assets<Image>>,
         Res<Generator>,
+        ResMut<DirtyRects>,
+        ResMut<PrefabPlaced>,
+        ResMut<PendingPrefabStamps>,
+        Res<PrefabConfigs>,
+        ResMut<WorldDb>,
     ),
-    mut task_executor: AsyncTaskRunner<(HashMap<IVec2, Chunk>, IVec2)>,
     materials: (Res<Assets<Materials>>, Res<MaterialsHandle>),
 ) {
     let materials = materials.0.get(&materials.1 .0).unwrap();
 
-    let (mut saving_task, mut chunk_manager, mut images, generator) = resources;
+    let (
+        mut saving_task,
+        mut chunk_manager,
+        mut images,
+        generator,
+        mut dirty_rects,
+        mut prefab_placed,
+        mut pending_prefab_stamps,
+        prefab_configs,
+        mut world_db,
+    ) = resources;
+
+    let db = world_db.get_or_open().clone();
 
     let mut player_pos = player.single().pos;
     if player_pos.x < 0 {
@@ -586,61 +728,62 @@ pub fn update_manager_pos(
     let diff_y = player_pos.y - chunk_manager.pos.y - LOAD_HEIGHT / 2;
     let new_diff = ivec2(diff_x, diff_y);
 
-    if task_executor.is_idle() {
-        if let Some(task) = &saving_task.0 {
-            if task.is_finished() {
-                saving_task.0 = None;
-            } else {
-                return;
-            }
+    // If a flush is in progress, don't queue another one.
+    if let Some(task) = &saving_task.0 {
+        if task.is_finished() {
+            saving_task.0 = None;
+        }
+    }
+
+    // Apply at most one move step per frame to avoid hitches.
+    const MAX_STEPS_PER_FRAME: i32 = 1;
+    let mut diff = new_diff;
+    if diff == IVec2::ZERO {
+        // Nothing to stream; ensure any pending writes hit disk.
+        if saving_task.0.is_none() {
+            let pool = AsyncComputeTaskPool::get();
+            let db_for_task = db.clone();
+            saving_task.0 = Some(pool.spawn(async move {
+                let _ = db_for_task.flush_async().await;
+            }));
+        }
+        return;
+    }
+
+    let chunk_textures = chunk_textures.single();
+    for _ in 0..MAX_STEPS_PER_FRAME {
+        if diff == IVec2::ZERO {
+            break;
         }
 
-        if new_diff != IVec2::ZERO {
-            task_executor.start(async move {
-                let file = File::open("assets/world/world").unwrap();
-                let mut buffered = BufReader::new(file);
-
-                let chunks: HashMap<IVec2, Chunk> =
-                    bincode::deserialize_from(&mut buffered).unwrap();
-                (chunks, new_diff)
-            });
-        }
-    } else {
-        match task_executor.poll() {
-            Poll::Ready(v) => {
-                if let Ok((mut file_chunks, diff)) = v {
-                    let chunk_textures = chunk_textures.single();
-                    for _ in 0..diff.x.abs() {
-                        chunk_manager.move_manager(
-                            &mut commands,
-                            &mut images,
-                            &chunk_textures,
-                            &image_entities,
-                            &mut file_chunks,
-                            (MoveDir::X(diff.x.signum()), materials, &generator),
-                        );
-                    }
-
-                    for _ in 0..diff.y.abs() {
-                        chunk_manager.move_manager(
-                            &mut commands,
-                            &mut images,
-                            &chunk_textures,
-                            &image_entities,
-                            &mut file_chunks,
-                            (MoveDir::Y(diff.y.signum()), materials, &generator),
-                        );
-                    }
-
-                    let pool = AsyncComputeTaskPool::get();
-                    saving_task.0 = Some(pool.spawn(async move {
-                        let file = File::create("assets/world/world").unwrap();
-                        let mut buffered = BufWriter::new(file);
-                        bincode::serialize_into(&mut buffered, &file_chunks).unwrap();
-                    }));
-                }
-            }
-            Poll::Pending => {}
+        if diff.x != 0 {
+            chunk_manager.move_manager(
+                &mut commands,
+                &mut images,
+                &mut dirty_rects,
+                (
+                    &mut prefab_placed,
+                    &mut pending_prefab_stamps,
+                    &prefab_configs,
+                ),
+                (&chunk_textures, &image_entities),
+                (&db, MoveDir::X(diff.x.signum()), materials, &generator),
+            );
+            diff.x -= diff.x.signum();
+        } else if diff.y != 0 {
+            chunk_manager.move_manager(
+                &mut commands,
+                &mut images,
+                &mut dirty_rects,
+                (
+                    &mut prefab_placed,
+                    &mut pending_prefab_stamps,
+                    &prefab_configs,
+                ),
+                (&chunk_textures, &image_entities),
+                (&db, MoveDir::Y(diff.y.signum()), materials, &generator),
+            );
+            diff.y -= diff.y.signum();
         }
     }
 }
@@ -730,6 +873,275 @@ fn clear_render_rect(mut dirty_rects: ResMut<DirtyRects>) {
 #[derive(Resource, Default)]
 pub struct HasCollider(pub Vec<IRect>);
 
+#[derive(Resource, Default)]
+pub struct BrokenAtoms(pub HashSet<IVec2>);
+
+const DETACH_MAX_CELLS: usize = 5000;
+const DETACH_MAX_SPAN: i32 = 128;
+const DETACH_MIN_CELLS: usize = 16;
+
+#[derive(Debug, Default)]
+struct BlobFloodResult {
+    cells: Vec<IVec2>,
+    min: IVec2,
+    max: IVec2,
+    touches_anchor: bool,
+    touches_unknown: bool,
+    anchored_by_threshold: bool,
+}
+
+fn flood_fill_blob_component(
+    chunk_manager: &ChunkManager,
+    start: IVec2,
+) -> Option<BlobFloodResult> {
+    let start_atom = chunk_manager.get_atom(&global_to_chunk(start))?;
+    if !blobable(start_atom) {
+        return None;
+    }
+
+    let mut out = BlobFloodResult {
+        min: start,
+        max: start,
+        ..Default::default()
+    };
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    visited.insert(start);
+    queue.push_back(start);
+
+    let neighbor_offsets = [
+        IVec2::new(1, 0),
+        IVec2::new(-1, 0),
+        IVec2::new(0, 1),
+        IVec2::new(0, -1),
+    ];
+
+    while let Some(pos) = queue.pop_front() {
+        out.cells.push(pos);
+
+        out.min.x = out.min.x.min(pos.x);
+        out.min.y = out.min.y.min(pos.y);
+        out.max.x = out.max.x.max(pos.x);
+        out.max.y = out.max.y.max(pos.y);
+
+        if out.cells.len() > DETACH_MAX_CELLS {
+            out.anchored_by_threshold = true;
+            break;
+        }
+        if (out.max.x - out.min.x) > DETACH_MAX_SPAN || (out.max.y - out.min.y) > DETACH_MAX_SPAN {
+            out.anchored_by_threshold = true;
+            break;
+        }
+
+        for off in neighbor_offsets {
+            let neigh = pos + off;
+            if visited.contains(&neigh) {
+                continue;
+            }
+
+            match chunk_manager.get_atom(&global_to_chunk(neigh)) {
+                Some(atom) if blobable(atom) => {
+                    visited.insert(neigh);
+                    queue.push_back(neigh);
+                }
+                Some(atom) => {
+                    // Neighbor is not part of this blob component.
+                    // If it's not air, the boundary isn't "air-only".
+                    if !(atom.is_void() || atom.is_liquid() || atom.is_powder()) {
+                        out.touches_anchor = true;
+                    }
+                }
+                None => {
+                    // Unloaded / missing chunk: we can't prove this blob is isolated.
+                    out.touches_unknown = true;
+                }
+            }
+        }
+    }
+
+    Some(out)
+}
+
+fn spawn_detached_rigidbody(
+    commands: &mut Commands,
+    images: &mut ResMut<Assets<Image>>,
+    chunk_manager: &mut ChunkManager,
+    dirty_rects: &mut DirtyRects,
+    blob: &BlobFloodResult,
+) {
+    let size = blob.max - blob.min + IVec2::ONE;
+    let width = size.x as usize;
+    let height = size.y as usize;
+    if width == 0 || height == 0 {
+        return;
+    }
+    if width > u8::MAX as usize || height > u8::MAX as usize {
+        return;
+    }
+
+    let mut atoms = vec![Atom::default(); width * height];
+    let mut values = vec![0.0_f64; width * height];
+    let mut image_data = vec![0_u8; width * height * 4];
+
+    let mut affected_chunks = HashSet::new();
+
+    for pos in &blob.cells {
+        let chunk_pos = global_to_chunk(*pos);
+        let Some(atom) = chunk_manager.get_atom(&chunk_pos) else {
+            continue;
+        };
+        if !blobable(atom) {
+            continue;
+        }
+
+        let lx = (pos.x - blob.min.x) as usize;
+        let ly = (pos.y - blob.min.y) as usize;
+        let i = ly * width + lx;
+
+        atoms[i] = *atom;
+        values[i] = 1.0;
+        let pixel_index = i * 4;
+        image_data[pixel_index..pixel_index + 4].copy_from_slice(&atom.color);
+    }
+
+    let image = Image::new(
+        Extent3d {
+            width: width as u32,
+            height: height as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        image_data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    let image_handle = images.add(image);
+
+    let collider = get_collider(&values, width as u32, height as u32);
+    let Some(collider) = collider else {
+        return;
+    };
+
+    // Remove blob cells from world and mark dirty rects.
+    for pos in &blob.cells {
+        let chunk_pos = global_to_chunk(*pos);
+        let Some(atom) = chunk_manager.get_mut_atom(chunk_pos) else {
+            continue;
+        };
+
+        if blobable(atom) {
+            *atom = Atom::default();
+            update_dirty_rects_3x3(&mut dirty_rects.current, chunk_pos);
+            update_dirty_rects(&mut dirty_rects.render, chunk_pos);
+            affected_chunks.insert(chunk_pos.chunk);
+        }
+    }
+
+    for chunk in affected_chunks {
+        if let Some(chunk) = chunk_manager.chunks.get(&chunk) {
+            if let Some(ent) = chunk.entity {
+                commands.entity(ent).remove::<Collider>();
+            }
+        }
+    }
+
+    let rigidbody = Rigidbody {
+        atoms,
+        width: width as u8,
+        height: height as u8,
+        filled: vec![],
+        ..Default::default()
+    };
+
+    commands
+        .spawn(collider)
+        .insert(rigidbody)
+        .insert(RapierRigidbody::Dynamic)
+        .insert(bevy_rapier2d::prelude::Velocity::zero())
+        .insert(bevy_rapier2d::prelude::ExternalImpulse::default())
+        .insert(ReadMassProperties::default())
+        .insert(Sprite {
+            image: image_handle,
+            anchor: bevy::sprite::Anchor::TopLeft,
+            ..Default::default()
+        })
+        .insert(Transform::from_xyz(
+            blob.min.x as f32,
+            -(blob.min.y as f32),
+            RIGIDBODY_LAYER,
+        ));
+}
+
+pub fn check_connectivity(
+    mut commands: Commands,
+    mut broken_atoms: ResMut<BrokenAtoms>,
+    mut chunk_manager: ResMut<ChunkManager>,
+    mut dirty_rects: ResMut<DirtyRects>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if broken_atoms.0.is_empty() {
+        return;
+    }
+
+    let broken_positions: Vec<IVec2> = broken_atoms.0.drain().collect();
+    let neighbor_offsets = [
+        IVec2::new(1, 0),
+        IVec2::new(-1, 0),
+        IVec2::new(0, 1),
+        IVec2::new(0, -1),
+    ];
+
+    let mut processed_seeds = HashSet::new();
+
+    for broken_pos in broken_positions {
+        for off in neighbor_offsets {
+            let seed = broken_pos + off;
+            if processed_seeds.contains(&seed) {
+                continue;
+            }
+
+            let flood = {
+                let cm: &ChunkManager = &chunk_manager;
+                flood_fill_blob_component(cm, seed)
+            };
+
+            let Some(flood) = flood else {
+                continue;
+            };
+
+            for p in &flood.cells {
+                processed_seeds.insert(*p);
+            }
+
+            // Anchor rules:
+            // - Too big (count or span) => anchored
+            // - Boundary touches anything non-void => anchored
+            // - Touches unloaded area => anchored (can't prove isolation)
+            // - Too small => ignore
+            if flood.cells.len() < DETACH_MIN_CELLS {
+                continue;
+            }
+            if flood.anchored_by_threshold || flood.touches_anchor || flood.touches_unknown {
+                continue;
+            }
+
+            spawn_detached_rigidbody(
+                &mut commands,
+                &mut images,
+                &mut chunk_manager,
+                &mut dirty_rects,
+                &flood,
+            );
+        }
+    }
+}
+
+pub fn blobable(atom: &Atom) -> bool {
+    //Add some material constraints too maybe
+    atom.is_solid()
+}
+
 pub struct ChunkManagerPlugin;
 impl Plugin for ChunkManagerPlugin {
     fn build(&self, app: &mut App) {
@@ -738,6 +1150,7 @@ impl Plugin for ChunkManagerPlugin {
                 FixedUpdate,
                 chunk_manager_update.run_if(in_state(GameState::Game)),
             )
+            .add_systems(Last, save_chunks_on_exit)
             .add_systems(
                 Update,
                 (
@@ -752,10 +1165,18 @@ impl Plugin for ChunkManagerPlugin {
                 PreUpdate,
                 clear_render_rect.run_if(in_state(GameState::Game)),
             )
+            .add_systems(
+                PostUpdate,
+                check_connectivity.run_if(in_state(GameState::Game)),
+            )
             .init_resource::<HasCollider>()
             .init_resource::<ChunkManager>()
             .init_resource::<DirtyRects>()
-            .init_resource::<Generator>();
+            .init_resource::<Generator>()
+            .init_resource::<PrefabPlaced>()
+            .init_resource::<PendingPrefabStamps>()
+            .init_resource::<WorldDb>()
+            .init_resource::<BrokenAtoms>();
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
