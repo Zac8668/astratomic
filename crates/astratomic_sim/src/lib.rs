@@ -9,6 +9,7 @@ pub mod prefabs;
 pub mod rigidbody;
 pub mod world;
 pub mod world_store;
+pub mod worldgen;
 
 pub use world_store as storage;
 

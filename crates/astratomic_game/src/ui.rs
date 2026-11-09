@@ -56,8 +56,8 @@ pub struct DebugToolState {
     pub camera_speed: f32,
     pub reset_camera_requested: bool,
     pub respawn_player_requested: bool,
-    pub gen_scale: f64,
-    pub gen_seed: u32,
+    /// Draft generator settings edited in the UI, applied on "Regenerate Active Window".
+    pub gen_draft: Generator,
     pub gen_params_initialized: bool,
     pub smoothed_fps: f32,
     pub prev_cursor_global: Option<IVec2>,
@@ -91,8 +91,7 @@ impl Default for DebugToolState {
             camera_speed: 320.0,
             reset_camera_requested: false,
             respawn_player_requested: false,
-            gen_scale: 512.0,
-            gen_seed: 8668,
+            gen_draft: Generator::default_config(),
             gen_params_initialized: false,
             smoothed_fps: 60.0,
             prev_cursor_global: None,
@@ -675,9 +674,8 @@ pub fn debug_ui_system(
         return;
     };
 
-    if !state.gen_params_initialized && generator.1 > 0.0 {
-        state.gen_scale = generator.1;
-        state.gen_seed = generator.2;
+    if !state.gen_params_initialized && generator.scale > 0.0 {
+        state.gen_draft = *generator;
         state.gen_params_initialized = true;
     }
 
@@ -989,29 +987,47 @@ pub fn debug_ui_system(
             egui::CollapsingHeader::new("Procedural Generator Settings")
                 .default_open(false)
                 .show(ui, |ui| {
+                    let draft = &mut state.gen_draft;
                     ui.horizontal(|ui| {
                         ui.label("Seed:");
-                        ui.add(egui::DragValue::new(&mut state.gen_seed).speed(1.0));
+                        ui.add(egui::DragValue::new(&mut draft.seed).speed(1.0));
                         if ui.small_button("Random").clicked() {
-                            state.gen_seed = fastrand::u32(..);
+                            draft.seed = fastrand::u32(..);
                         }
                     });
+                    ui.add(
+                        egui::Slider::new(&mut draft.scale, 128.0..=40960.0)
+                            .text("Feature Scale")
+                            .suffix(" px"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut draft.surface_level, -1024..=0)
+                            .text("Surface Level (Y)"),
+                    );
+                    ui.add(egui::Slider::new(&mut draft.hill_amplitude, 0.0..=1600.0).text("Hills"));
+                    ui.add(
+                        egui::Slider::new(&mut draft.mountain_amplitude, 0.0..=2400.0)
+                            .text("Mountains"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut draft.cave_density, 0.0..=20.0).text("Cave Density"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut draft.cave_fade_depth, 1.0..=2000.0)
+                            .text("Cave Surface Fade"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut draft.ore_richness, 0.0..=3.0).text("Ore Richness"),
+                    );
+
                     ui.horizontal(|ui| {
-                        ui.label("Scale:");
-                        ui.add(
-                            egui::Slider::new(&mut state.gen_scale, 128.0..=1024.0).suffix(" px"),
-                        );
+                        if ui.small_button("Reset Defaults").clicked() {
+                            state.gen_draft = Generator::default_config();
+                        }
                     });
 
                     if ui.button("🔄 Regenerate Active Window").clicked() {
-                        *generator = Generator::from_params(
-                            state.gen_scale,
-                            8,
-                            2.0,
-                            0.8,
-                            2.0,
-                            state.gen_seed,
-                        );
+                        *generator = state.gen_draft;
                         chunk_world.regenerate_window(
                             &materials,
                             &generator,

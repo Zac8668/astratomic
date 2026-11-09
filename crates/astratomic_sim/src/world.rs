@@ -6,7 +6,6 @@ use std::{
 
 use bones_framework::prelude::*;
 use itertools::Itertools;
-use noise::{MultiFractal, RidgedMulti, SuperSimplex};
 
 use crate::{
     atom::{Atom, Materials},
@@ -20,48 +19,7 @@ use crate::{
     world_store::{IoResponse, WorldIoWorker, WorldSaveHandle, WorldStorage},
 };
 
-#[derive(HasSchema, Clone, Default)]
-pub struct Generator(pub RidgedMulti<SuperSimplex>, pub f64, pub u32);
-
-impl Generator {
-    pub fn from_params(
-        scale: f64,
-        octaves: usize,
-        lacunarity: f64,
-        persistence: f64,
-        attenuation: f64,
-        seed: u32,
-    ) -> Self {
-        let ridged = RidgedMulti::<SuperSimplex>::new(seed)
-            .set_octaves(octaves)
-            .set_lacunarity(lacunarity)
-            .set_persistence(persistence)
-            .set_attenuation(attenuation);
-        Self(ridged, scale, seed)
-    }
-
-    pub fn from_ron_bytes(bytes: &[u8]) -> Result<Self, ron::error::SpannedError> {
-        let gen_config = ron::de::from_bytes::<[f64; 6]>(bytes)?;
-        let scale = gen_config[0];
-        let octaves = gen_config[1] as usize;
-        let lacunarity = gen_config[2];
-        let persistence = gen_config[3];
-        let attenuation = gen_config[4];
-        let seed = gen_config[5] as u32;
-        Ok(Self::from_params(
-            scale,
-            octaves,
-            lacunarity,
-            persistence,
-            attenuation,
-            seed,
-        ))
-    }
-
-    pub fn default_config() -> Self {
-        Self::from_params(512.0, 8, 2.0, 0.8, 2.0, 8668)
-    }
-}
+pub use crate::worldgen::Generator;
 
 /// Runtime simulation settings and camera focus point for chunk streaming and debug controls.
 #[derive(HasSchema, Clone, Debug)]
@@ -447,7 +405,7 @@ impl ChunkWorld {
             prefab_placed,
             pending_stamps,
             materials,
-            generator.2,
+            generator.seed,
         );
 
         let full_rect = URect::full_chunk();
@@ -824,7 +782,7 @@ pub fn setup_chunk_world_system(
             &mut prefab_placed,
             &mut pending_prefab_stamps,
             &materials,
-            generator.2,
+            generator.seed,
         );
     }
 
@@ -922,7 +880,7 @@ pub fn poll_chunk_io_system(
                 pending,
                 configs,
                 mats,
-                generator.2,
+                generator.seed,
                 pos,
             );
         }

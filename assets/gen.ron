@@ -1,19 +1,25 @@
+// Procedural world generator settings (`astratomic_sim::worldgen::Generator`).
+// Every field is optional; missing fields use the defaults shown here.
 (
-    //Scale
-    512.0,
+    // World seed
+    seed: 8668,
 
-    //Octaves (Rounds to integer)
-    8.,
+    // Feature size in atoms (512 = default). Larger stretches hills, caves and ore veins.
+    scale: 512.0,
 
-    //Lacunarity
-    2.0,
+    // Average global atom Y of the surface (+Y is down, so negative is up)
+    surface_level: -256,
 
-    //Persistence
-    0.8,
+    // Height (atoms) of rolling hills and of ridged mountain ranges
+    hill_amplitude: 48.0,
+    mountain_amplitude: 70.0,
 
-    //Attenuation
-    2.0,
+    // Cave tunnel width / chamber frequency multiplier (0 = no caves)
+    cave_density: 1.0,
 
-    //Seed (Rounds to integer)
-    8668.,
+    // Depth (atoms) over which caves fade in below the surface
+    cave_fade_depth: 56.0,
+
+    // Ore vein thickness multiplier (0 = no ores)
+    ore_richness: 1.0,
 )

@@ -1,7 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
 use bones_schema::HasSchema;
-use noise::*;
 
 pub use crate::consts::CHUNK_SIZE;
 use crate::{prelude::*, rigidbody};
@@ -152,14 +151,6 @@ impl Drop for Chunk {
     }
 }
 
-#[derive(Clone, Copy)]
-struct YCoord;
-impl NoiseFn<f64, 2> for YCoord {
-    fn get(&self, point: [f64; 2]) -> f64 {
-        point[1]
-    }
-}
-
 impl Chunk {
     pub fn from_grid(grid: Arc<ChunkGrid>) -> Self {
         Self {
@@ -213,82 +204,13 @@ impl Chunk {
         Arc::make_mut(&mut self.grid).atoms.get_mut(index)
     }
 
+    /// Procedurally generate the grid for chunk `index` (see [`crate::worldgen`]).
     pub fn generate_grid(
         index: IVec2,
         materials: &Materials,
         generator: &Generator,
     ) -> Arc<ChunkGrid> {
-        let mut grid = ChunkGrid::new_zeroed_box();
-
-        let air_limit = -1000.;
-        let scale = if generator.1 == 0.0 {
-            512.0
-        } else {
-            generator.1
-        };
-        let cave = generator.0.clone();
-
-        let cave: Multiply<f64, RidgedMulti<SuperSimplex>, Constant, 2> =
-            Multiply::new(cave, Constant::new(0.7));
-
-        let ground_noise = BasicMulti::<SuperSimplex>::new(generator.2);
-        let ground = Add::new(
-            ScalePoint::new(ground_noise)
-                .set_y_scale(0.3)
-                .set_x_scale(0.3),
-            YCoord,
-        );
-
-        let cave_start = 0.5;
-        let falloff = 0.3;
-        let control = Add::new(ground.clone(), Constant::new(-cave_start));
-        let generator = Select::new(cave.clone(), ground.clone(), control.clone())
-            .set_bounds(air_limit, cave_start)
-            .set_falloff(falloff);
-
-        for x in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_SIZE {
-                let pos = [
-                    (index.x as f64 * CHUNK_SIZE as f64 + x as f64) / scale,
-                    (index.y as f64 * CHUNK_SIZE as f64 + y as f64) / scale,
-                ];
-                let ground_val = ground.get(pos);
-                let control_val = ground_val - cave_start;
-                let noise = if ((air_limit + falloff)..(cave_start - falloff))
-                    .contains(&control_val)
-                {
-                    ground_val
-                } else if control_val >= cave_start + falloff || control_val < air_limit - falloff {
-                    cave.get(pos)
-                } else {
-                    generator.get(pos)
-                };
-                let i = y * CHUNK_SIZE + x;
-
-                let id: u8 = if (air_limit..(cave_start - falloff)).contains(&control_val) {
-                    // Ground layer
-                    match (noise + 1.) / 2. {
-                        ..0.2 => continue,
-                        0.2..0.21 => 6,
-                        0.21..0.5 => 7,
-                        0.5..0.75 => 10,
-                        0.75.. => 4,
-                        _ => panic!("{noise}"),
-                    }
-                } else {
-                    // Cave layer
-                    match (noise + 1.) / 2. {
-                        ..0.2 => continue,
-                        0.2.. => 8,
-                        _ => panic!("{noise}"),
-                    }
-                };
-
-                grid.atoms[i] = Atom::new(id, materials);
-            }
-        }
-
-        Arc::from(grid)
+        generator.generate_grid(index, materials)
     }
 
     pub fn new(

@@ -24,5 +24,11 @@
     //11 Leaves
     (default_state: Solid),
     //12 Wood
+    (default_state: Solid),
+    //13 Coal
+    (default_state: Solid),
+    //14 Iron ore
+    (default_state: Solid),
+    //15 Gold ore
     (default_state: Solid)
 ])

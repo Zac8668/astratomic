@@ -59,7 +59,7 @@ impl AtomState {
             1 => Self::Object,
             2 | 4 => Self::Powder,
             3 | 5 | 9 => Self::Liquid,
-            6 | 7 | 8 | 10 | 11 | 12 => Self::Solid,
+            6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 => Self::Solid,
             _ => Self::Solid,
         }
     }
@@ -173,6 +173,21 @@ impl Materials {
                 default_state: AtomState::Solid,
                 ..Default::default()
             },
+            // 13: Coal
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
+            // 14: Iron Ore
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
+            // 15: Gold Ore
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
         ])
     }
 }
@@ -235,7 +250,15 @@ impl Atom {
         }
     }
 
+    /// Create a new atom of material `id` with randomized color noise from the global RNG.
     pub fn new(id: u8, materials: &Materials) -> Self {
+        let mut rng = fastrand::Rng::with_seed(fastrand::u64(..));
+        Self::new_with_rng(id, materials, &mut rng)
+    }
+
+    /// Create a new atom of material `id`, drawing color noise from `rng` so procedural
+    /// generation with a seeded [`fastrand::Rng`] is fully deterministic.
+    pub fn new_with_rng(id: u8, materials: &Materials, rng: &mut fastrand::Rng) -> Self {
         if id == 0 {
             return Self::VOID;
         }
@@ -252,79 +275,100 @@ impl Atom {
         let color = match id {
             2 => [
                 // Sand
-                (230 + fastrand::i16(-20..20)) as u8,
-                (197 + fastrand::i16(-20..20)) as u8,
-                (92 + fastrand::i16(-20..20)) as u8,
+                (230 + rng.i16(-20..20)) as u8,
+                (197 + rng.i16(-20..20)) as u8,
+                (92 + rng.i16(-20..20)) as u8,
                 255,
             ],
             3 => [
                 // Water
-                (20 + fastrand::i16(-20..20)) as u8,
-                (125 + fastrand::i16(-20..20)) as u8,
-                (204 + fastrand::i16(-20..20)) as u8,
+                (20 + rng.i16(-20..20)) as u8,
+                (125 + rng.i16(-20..20)) as u8,
+                (204 + rng.i16(-20..20)) as u8,
                 150,
             ],
             4 => [
                 // Gravel
-                (110 + fastrand::i16(-12..12)) as u8,
-                (110 + fastrand::i16(-12..12)) as u8,
-                (110 + fastrand::i16(-12..12)) as u8,
+                (110 + rng.i16(-12..12)) as u8,
+                (110 + rng.i16(-12..12)) as u8,
+                (110 + rng.i16(-12..12)) as u8,
                 255,
             ],
             5 => [
                 // Lava
-                (245 + fastrand::i16(-10..10)) as u8,
-                (140 + fastrand::i16(-20..20)) as u8,
-                (10 + fastrand::i16(-10..10)) as u8,
+                (245 + rng.i16(-10..10)) as u8,
+                (140 + rng.i16(-20..20)) as u8,
+                (10 + rng.i16(-10..10)) as u8,
                 255,
             ],
             6 => [
                 // Grass
-                (40 + fastrand::i16(-10..10)) as u8,
-                (165 + fastrand::i16(-10..10)) as u8,
-                (49 + fastrand::i16(-5..5)) as u8,
+                (40 + rng.i16(-10..10)) as u8,
+                (165 + rng.i16(-10..10)) as u8,
+                (49 + rng.i16(-5..5)) as u8,
                 255,
             ],
             7 => [
                 // Dirt
-                (120 + fastrand::i16(-10..10)) as u8,
-                (70 + fastrand::i16(-10..10)) as u8,
-                (40 + fastrand::i16(-5..5)) as u8,
+                (120 + rng.i16(-10..10)) as u8,
+                (70 + rng.i16(-10..10)) as u8,
+                (40 + rng.i16(-5..5)) as u8,
                 255,
             ],
             8 => [
                 // Rock
-                (80 + fastrand::i16(-10..10)) as u8,
-                (80 + fastrand::i16(-10..10)) as u8,
-                (80 + fastrand::i16(-5..5)) as u8,
+                (80 + rng.i16(-10..10)) as u8,
+                (80 + rng.i16(-10..10)) as u8,
+                (80 + rng.i16(-5..5)) as u8,
                 255,
             ],
             9 => [
                 // Acid
-                (10 + fastrand::i16(-10..10)) as u8,
-                (230 + fastrand::i16(-10..10)) as u8,
-                (40 + fastrand::i16(-5..5)) as u8,
+                (10 + rng.i16(-10..10)) as u8,
+                (230 + rng.i16(-10..10)) as u8,
+                (40 + rng.i16(-5..5)) as u8,
                 255,
             ],
             10 => [
                 // Compacted Dirt
-                (100 + fastrand::i16(-10..10)) as u8,
-                (50 + fastrand::i16(-10..10)) as u8,
-                (30 + fastrand::i16(-5..5)) as u8,
+                (100 + rng.i16(-10..10)) as u8,
+                (50 + rng.i16(-10..10)) as u8,
+                (30 + rng.i16(-5..5)) as u8,
                 255,
             ],
             11 => [
                 // Leaves
-                (60 + fastrand::i16(-15..15)) as u8,
-                (180 + fastrand::i16(-20..20)) as u8,
-                (60 + fastrand::i16(-10..10)) as u8,
+                (60 + rng.i16(-15..15)) as u8,
+                (180 + rng.i16(-20..20)) as u8,
+                (60 + rng.i16(-10..10)) as u8,
                 220,
             ],
             12 => [
                 // Wood
-                (120 + fastrand::i16(-10..10)) as u8,
-                (80 + fastrand::i16(-10..10)) as u8,
-                (40 + fastrand::i16(-5..5)) as u8,
+                (120 + rng.i16(-10..10)) as u8,
+                (80 + rng.i16(-10..10)) as u8,
+                (40 + rng.i16(-5..5)) as u8,
+                255,
+            ],
+            13 => [
+                // Coal
+                (34 + rng.i16(-6..6)) as u8,
+                (32 + rng.i16(-6..6)) as u8,
+                (36 + rng.i16(-6..6)) as u8,
+                255,
+            ],
+            14 => [
+                // Iron Ore
+                (168 + rng.i16(-14..14)) as u8,
+                (104 + rng.i16(-12..12)) as u8,
+                (78 + rng.i16(-10..10)) as u8,
+                255,
+            ],
+            15 => [
+                // Gold Ore
+                (238 + rng.i16(-12..12)) as u8,
+                (190 + rng.i16(-16..16)) as u8,
+                (52 + rng.i16(-12..12)) as u8,
                 255,
             ],
             _ => panic!("Atom not found, invalid ID. {id}"),
@@ -333,7 +377,7 @@ impl Atom {
         Self::with_state(id, state, color)
     }
 
-    pub const PAINTABLE_MATERIAL_IDS: [u8; 12] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    pub const PAINTABLE_MATERIAL_IDS: [u8; 15] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
     #[inline]
     pub const fn material_name(id: u8) -> &'static str {
@@ -351,6 +395,9 @@ impl Atom {
             10 => "Compacted Dirt",
             11 => "Leaves",
             12 => "Wood",
+            13 => "Coal",
+            14 => "Iron Ore",
+            15 => "Gold Ore",
             _ => "Unknown",
         }
     }
@@ -371,6 +418,9 @@ impl Atom {
             10 => [100, 50, 30, 255],
             11 => [60, 180, 60, 220],
             12 => [120, 80, 40, 255],
+            13 => [34, 32, 36, 255],
+            14 => [168, 104, 78, 255],
+            15 => [238, 190, 52, 255],
             _ => [255, 0, 255, 255],
         }
     }

@@ -26,7 +26,7 @@ serde.workspace = true
 ron.workspace = true
 thiserror.workspace = true
 
-noise = "0.9.0"
+fastnoise-lite = "1.1"
 contour = "0.13"
 geo = "0.29"
 image = { version = "0.24", default-features = false, features = ["png"] }
