@@ -27,8 +27,10 @@ bones_schema.workspace = true
 bones_wgpu_renderer.workspace = true
 
 bytemuck.workspace = true
+fastnoise-lite = "1.1"
 fastrand = "2.5"
 glam.workspace = true
+image = { version = "0.24", default-features = false, features = ["png"] }
 serde.workspace = true
 ron.workspace = true
 thiserror.workspace = true

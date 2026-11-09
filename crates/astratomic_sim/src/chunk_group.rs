@@ -183,7 +183,7 @@ pub fn update_chunk_groups(
     manager_pos: IVec2,
     new_dirty_rects: &mut HashMap<IVec2, URect>,
     render_dirty_rects: &mut HashMap<IVec2, URect>,
-    (dt, materials): (u8, &Materials),
+    (dt, materials, tick, world_seed): (u8, &Materials, u64, u32),
 ) {
     puffin::profile_function!();
 
@@ -248,6 +248,8 @@ pub fn update_chunk_groups(
                     dirty_update_rects: new_dirty_rects,
                     dirty_render_rects: render_dirty_rects,
                     materials,
+                    tick,
+                    world_seed,
                 },
                 dt,
                 rect,
@@ -276,6 +278,8 @@ pub fn update_chunk_groups(
                             dirty_update_rects: &mut local_update,
                             dirty_render_rects: &mut local_render,
                             materials,
+                            tick,
+                            world_seed,
                         },
                         dt,
                         rect,

@@ -11,15 +11,54 @@ use crate::{
     atom::{Atom, Materials},
     ca::step_chunk_simulation,
     chunk::{CHUNK_SIZE, Chunk, ChunkGrid},
-    consts::{CHUNK_LENGHT, LOAD_HEIGHT, LOAD_WIDTH},
-    prefabs::{
-        PendingPrefabStamps, PrefabConfigs, PrefabPlaced, apply_pending_stamps_for_chunk,
-        prefab_xs_for_chunk, stamp_prefab_at_x, stamp_prefabs_for_new_chunk,
-    },
+    consts::{LOAD_HEIGHT, LOAD_WIDTH},
     world_store::{IoResponse, WorldIoWorker, WorldSaveHandle, WorldStorage},
 };
 
-pub use crate::worldgen::Generator;
+/// Closure callback type for generating chunk grids procedurally.
+pub type ChunkGeneratorFn = Arc<dyn Fn(IVec2, &Materials) -> Arc<ChunkGrid> + Send + Sync>;
+
+/// Hook for procedural chunk generation when chunks are missing from persistence or regenerated.
+#[derive(Clone, Default, HasSchema)]
+#[schema(opaque)]
+pub struct ChunkGeneratorHook {
+    #[schema(opaque)]
+    pub generate_fn: Option<ChunkGeneratorFn>,
+    pub seed: u32,
+}
+
+impl std::fmt::Debug for ChunkGeneratorHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkGeneratorHook")
+            .field("is_set", &self.generate_fn.is_some())
+            .field("seed", &self.seed)
+            .finish()
+    }
+}
+
+impl ChunkGeneratorHook {
+    pub fn new<F>(seed: u32, f: F) -> Self
+    where
+        F: Fn(IVec2, &Materials) -> Arc<ChunkGrid> + Send + Sync + 'static,
+    {
+        Self {
+            generate_fn: Some(Arc::new(f)),
+            seed,
+        }
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.generate_fn.is_some()
+    }
+
+    pub fn generate_grid(&self, pos: IVec2, materials: &Materials) -> Arc<ChunkGrid> {
+        if let Some(ref f) = self.generate_fn {
+            f(pos, materials)
+        } else {
+            Arc::new(ChunkGrid::default())
+        }
+    }
+}
 
 /// Runtime simulation settings and camera focus point for chunk streaming and debug controls.
 #[derive(HasSchema, Clone, Debug)]
@@ -149,6 +188,15 @@ pub enum MoveDir {
     Y(i32),
 }
 
+/// Tracks the [`AssetServer`] handle and content ID (CID) for automatic `atoms.ron` hot-reloading.
+#[derive(Clone, Copy, Debug, Default, HasSchema, PartialEq, Eq)]
+#[schema(opaque)]
+#[repr(C)]
+pub struct MaterialsAssetTracker {
+    pub handle: Handle<Materials>,
+    pub last_cid: [u8; 32],
+}
+
 /// Active world chunk container for `bones_ecs`.
 ///
 /// Each [`Chunk`] stores its atom grid as an `Arc<ChunkGrid>` so `bones_ecs` rollback snapshots
@@ -159,6 +207,8 @@ pub struct ChunkWorld {
     pub chunks: HashMap<IVec2, Chunk>,
     pub pos: IVec2,
     pub dt: u8,
+    pub tick: u64,
+    pub seed: u32,
     pub save_handle: Option<WorldSaveHandle>,
 }
 
@@ -168,6 +218,8 @@ impl Clone for ChunkWorld {
             chunks: self.chunks.clone(),
             pos: self.pos,
             dt: self.dt,
+            tick: self.tick,
+            seed: self.seed,
             // Cloned rollback snapshots do not inherit `save_handle` so dropping a snapshot
             // does not overwrite active world state on disk.
             save_handle: None,
@@ -371,19 +423,13 @@ impl ChunkWorld {
         io_worker.save_batch(batch);
     }
 
-    /// Regenerate all chunks in the current active window procedurally in parallel and stamp prefabs.
+    /// Regenerate all chunks in the current active window procedurally in parallel.
     pub fn regenerate_window(
         &mut self,
         materials: &Materials,
-        generator: &Generator,
-        prefab_configs: &mut PrefabConfigs,
-        prefab_placed: &mut PrefabPlaced,
-        pending_stamps: &mut PendingPrefabStamps,
+        generator: &ChunkGeneratorHook,
         dirty_rects: &mut DirtyRects,
     ) {
-        prefab_placed.x_ranges.clear();
-        pending_stamps.0.clear();
-
         let coords: Vec<IVec2> = (self.pos.x..(self.pos.x + LOAD_WIDTH))
             .cartesian_product(self.pos.y..(self.pos.y + LOAD_HEIGHT))
             .map(|(x, y)| ivec2(x, y))
@@ -397,16 +443,6 @@ impl ChunkWorld {
                 self.add_chunk(pos, Chunk::from_grid(grid));
             }
         }
-
-        stamp_initial_window_prefabs(
-            self,
-            dirty_rects,
-            prefab_configs,
-            prefab_placed,
-            pending_stamps,
-            materials,
-            generator.seed,
-        );
 
         let full_rect = URect::full_chunk();
         for &pos in &coords {
@@ -637,7 +673,7 @@ pub fn update_dirty_rects_3x3(dirty_rects: &mut HashMap<IVec2, URect>, pos: Chun
 fn generate_chunks_parallel(
     coords: &[IVec2],
     materials: &Materials,
-    generator: &Generator,
+    generator: &ChunkGeneratorHook,
 ) -> Vec<(IVec2, Arc<ChunkGrid>)> {
     if coords.is_empty() {
         return Vec::new();
@@ -655,7 +691,7 @@ fn generate_chunks_parallel(
             handles.push(s.spawn(move || {
                 slice
                     .iter()
-                    .map(|&pos| (pos, Chunk::generate_grid(pos, materials, generator)))
+                    .map(|&pos| (pos, generator.generate_grid(pos, materials)))
                     .collect::<Vec<_>>()
             }));
         }
@@ -670,80 +706,50 @@ fn generate_chunks_parallel(
     })
 }
 
-fn stamp_initial_window_prefabs(
-    chunk_world: &mut ChunkWorld,
-    dirty_rects: &mut DirtyRects,
-    prefab_configs: &mut PrefabConfigs,
-    prefab_placed: &mut PrefabPlaced,
-    pending_prefab_stamps: &mut PendingPrefabStamps,
-    materials: &Materials,
-    seed: u32,
-) {
-    for config in &mut prefab_configs.0 {
-        config.positions.clear();
-        for x in chunk_world.pos.x..(chunk_world.pos.x + LOAD_WIDTH) {
-            config
-                .positions
-                .extend(prefab_xs_for_chunk(config, x, seed));
-        }
-        config.positions.sort_unstable();
-        config.positions.dedup();
-    }
-
-    let min_y = chunk_world.pos.y * CHUNK_LENGHT as i32;
-    let max_y = (chunk_world.pos.y + LOAD_HEIGHT) * CHUNK_LENGHT as i32 - 1;
-    let y_seed = (chunk_world.pos.y + LOAD_HEIGHT / 2) * CHUNK_LENGHT as i32;
-
-    for config in &prefab_configs.0 {
-        for &x in &config.positions {
-            let _ = stamp_prefab_at_x(
-                chunk_world,
-                dirty_rects,
-                (prefab_placed, pending_prefab_stamps),
-                materials,
-                config,
-                (x, y_seed),
-                (min_y, max_y),
-            );
-        }
-    }
-}
-
-/// Startup system that loads `atoms.ron`, `gen.ron`, `prefabs/*`, opens `world.redb`,
+/// Startup system that loads `atoms.ron`, opens `world.redb`,
 /// populates the initial `LOAD_WIDTH x LOAD_HEIGHT` chunk window, and spawns [`WorldIoWorker`].
 pub fn setup_chunk_world_system(
     mut chunk_world: ResMut<ChunkWorld>,
     mut dirty_rects: ResMut<DirtyRects>,
     mut materials: ResMut<Materials>,
-    mut generator: ResMut<Generator>,
-    mut prefab_configs: ResMut<PrefabConfigs>,
-    mut prefab_placed: ResMut<PrefabPlaced>,
-    mut pending_prefab_stamps: ResMut<PendingPrefabStamps>,
+    mut tracker: ResMut<MaterialsAssetTracker>,
+    asset_server: Option<Res<AssetServer>>,
+    generator: Option<Res<ChunkGeneratorHook>>,
     mut io_worker: ResMut<WorldIoWorker>,
     sim_settings: Res<SimulationSettings>,
 ) {
     let assets_dir = resolve_assets_dir();
 
-    // 1. Load Materials from `assets/atoms.ron`
+    // 1. Load Materials from `assets/atoms.ron` (initial sync fallback)
     let atoms_path = assets_dir.join("atoms.ron");
     *materials = std::fs::read(&atoms_path)
         .ok()
         .and_then(|bytes| Materials::from_ron_bytes(&bytes).ok())
         .unwrap_or_else(Materials::default_builtin);
 
-    // 2. Load Generator from `assets/gen.ron`
-    let gen_path = assets_dir.join("gen.ron");
-    *generator = std::fs::read(&gen_path)
-        .ok()
-        .and_then(|bytes| Generator::from_ron_bytes(&bytes).ok())
-        .unwrap_or_else(Generator::default_config);
+    if let Some(ref server) = asset_server {
+        let handle = server
+            .load_asset(AssetLocRef {
+                path: Path::new("atoms.ron"),
+                pack: None,
+            })
+            .typed::<Materials>();
+        tracker.handle = handle;
+        if let Some(cid) = server.store.asset_ids.get(&handle.untyped()).map(|c| c.0) {
+            if let Some(Ok(loaded)) = server.try_get(handle) {
+                *materials = (*loaded).clone();
+                tracker.last_cid = cid;
+            }
+        }
+    }
 
-    // 3. Load PrefabConfigs from `assets/prefabs/*`
-    *prefab_configs = PrefabConfigs::load_from_assets_dir(&assets_dir);
-    prefab_placed.x_ranges.clear();
-    pending_prefab_stamps.0.clear();
+    if let Some(ref hook) = generator {
+        chunk_world.seed = hook.seed;
+    } else if chunk_world.seed == 0 {
+        chunk_world.seed = 8668;
+    }
 
-    // 4. Center initial chunk window around `sim_settings.focus_world_pos`
+    // 2. Center initial chunk window around `sim_settings.focus_world_pos`
     let focus_global = world_to_global_atom(sim_settings.focus_world_pos);
     let focus_chunk = global_to_chunk(focus_global).chunk;
     chunk_world.pos = ivec2(
@@ -752,7 +758,7 @@ pub fn setup_chunk_world_system(
     );
     chunk_world.chunks.clear();
 
-    // 5. Open `saves/world.redb` (outside `assets/`) and populate the initial window
+    // 3. Open `saves/world.redb` (outside `assets/`) and populate the initial window
     let db_path = resolve_world_db_path();
     let storage = WorldStorage::open(&db_path).ok();
     let is_new_world = storage.as_ref().is_none_or(|s| !s.has_any_chunks());
@@ -769,21 +775,15 @@ pub fn setup_chunk_world_system(
         }
     }
 
-    let generated = generate_chunks_parallel(&to_generate, &materials, &generator);
-    for (pos, grid) in generated {
-        chunk_world.add_chunk(pos, Chunk::from_grid(grid));
-    }
-
-    if is_new_world {
-        stamp_initial_window_prefabs(
-            &mut chunk_world,
-            &mut dirty_rects,
-            &mut prefab_configs,
-            &mut prefab_placed,
-            &mut pending_prefab_stamps,
-            &materials,
-            generator.seed,
-        );
+    if let Some(ref hook) = generator {
+        let generated = generate_chunks_parallel(&to_generate, &materials, hook);
+        for (pos, grid) in generated {
+            chunk_world.add_chunk(pos, Chunk::from_grid(grid));
+        }
+    } else {
+        for pos in to_generate {
+            chunk_world.add_chunk(pos, Chunk::default());
+        }
     }
 
     let full_rect = URect::full_chunk();
@@ -803,6 +803,39 @@ pub fn setup_chunk_world_system(
     }
 }
 
+/// Pre-update system that monitors [`AssetServer`] for `atoms.ron` updates and hot-reloads [`Materials`].
+pub fn hot_reload_materials_system(
+    asset_server: Option<Res<AssetServer>>,
+    mut tracker: ResMut<MaterialsAssetTracker>,
+    mut materials: ResMut<Materials>,
+) {
+    let Some(ref server) = asset_server else {
+        return;
+    };
+
+    if tracker.handle == Handle::default() {
+        tracker.handle = server
+            .load_asset(AssetLocRef {
+                path: Path::new("atoms.ron"),
+                pack: None,
+            })
+            .typed::<Materials>();
+    }
+
+    let handle = tracker.handle;
+    let Some(cid) = server.store.asset_ids.get(&handle.untyped()).map(|c| c.0) else {
+        return;
+    };
+
+    if cid != tracker.last_cid {
+        if let Some(Ok(loaded)) = server.try_get(handle) {
+            *materials = (*loaded).clone();
+            tracker.last_cid = cid;
+            tracing::info!("Hot-reloaded Materials from atoms.ron (cid: {})", Cid(cid));
+        }
+    }
+}
+
 /// Simulation system that polls completed [`IoResponse::ChunkLoaded`] messages from the
 /// deterministic queue in [`WorldIoWorker`] and integrates them into [`ChunkWorld`].
 pub fn poll_chunk_io_system(
@@ -810,10 +843,7 @@ pub fn poll_chunk_io_system(
     mut chunk_world: ResMut<ChunkWorld>,
     mut dirty_rects: ResMut<DirtyRects>,
     materials: Option<Res<Materials>>,
-    generator: Option<Res<Generator>>,
-    prefab_configs: Option<Res<PrefabConfigs>>,
-    mut prefab_placed: Option<ResMut<PrefabPlaced>>,
-    mut pending_prefab_stamps: Option<ResMut<PendingPrefabStamps>>,
+    generator: Option<Res<ChunkGeneratorHook>>,
 ) {
     let full_rect = URect::full_chunk();
     let mut loaded_from_file = Vec::new();
@@ -843,7 +873,7 @@ pub fn poll_chunk_io_system(
 
     if !missing_to_generate.is_empty() {
         match (materials.as_deref(), generator.as_deref()) {
-            (Some(mats), Some(generator)) if !mats.0.is_empty() => {
+            (Some(mats), Some(generator)) if !mats.0.is_empty() && generator.is_set() => {
                 let generated = generate_chunks_parallel(&missing_to_generate, mats, generator);
                 for (pos, grid) in generated {
                     chunk_world.add_chunk(pos, Chunk::from_grid(grid));
@@ -858,31 +888,6 @@ pub fn poll_chunk_io_system(
                     dirty_rects.render.insert(pos, full_rect);
                 }
             }
-        }
-    }
-
-    if let (Some(mats), Some(generator), Some(configs), Some(placed), Some(pending)) = (
-        materials.as_deref(),
-        generator.as_deref(),
-        prefab_configs.as_deref(),
-        prefab_placed.as_deref_mut(),
-        pending_prefab_stamps.as_deref_mut(),
-    ) && !mats.0.is_empty()
-    {
-        for &(pos, _) in &loaded_from_file {
-            apply_pending_stamps_for_chunk(&mut chunk_world, &mut dirty_rects, mats, pending, pos);
-        }
-        for &pos in &missing_to_generate {
-            stamp_prefabs_for_new_chunk(
-                &mut chunk_world,
-                &mut dirty_rects,
-                placed,
-                pending,
-                configs,
-                mats,
-                generator.seed,
-                pos,
-            );
         }
     }
 }
@@ -943,3 +948,136 @@ pub fn chunk_world_update_system(
         step_chunk_simulation(&mut chunk_world, &mut dirty_rects, &materials);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::register_sim_schemas;
+    use bones_asset::{FileAssetIo, Version};
+
+    #[test]
+    fn test_materials_hot_reloading() {
+        bevy_tasks::IoTaskPool::init(bevy_tasks::TaskPool::default);
+        register_sim_schemas();
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "astratomic_test_materials_{}_{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let atoms_path = temp_dir.join("atoms.ron");
+        let initial_ron = r#"([
+            (default_state: Void),
+            (default_state: Object),
+            (default_state: Powder, inertial_resistance: 0.1),
+            (default_state: Liquid, flow: 5),
+            (default_state: Powder, inertial_resistance: 0.60),
+        ])"#;
+        std::fs::write(&atoms_path, initial_ron).unwrap();
+
+        let mut game = Game::new();
+        game.install_plugin(DefaultGamePlugin);
+        let server = AssetServer::new(
+            FileAssetIo::new(&temp_dir, &temp_dir),
+            Version::new(0, 1, 0),
+        );
+        server.watch_for_changes();
+
+        game.insert_shared_resource(server);
+        game.install_plugin(crate::plugin::AstratomicSimPlugin);
+
+        game.sessions.create_with("test", |session: &mut Session| {
+            session
+                .install_plugin(DefaultSessionPlugin)
+                .install_plugin(crate::plugin::AstratomicSimPlugin);
+        });
+
+        // Insert AssetServer into session world so session systems can access Res<AssetServer>
+        {
+            let server_clone = (*game.shared_resource::<AssetServer>()).clone();
+            let session = game.sessions.get_mut("test").unwrap();
+            session.world.insert_resource(server_clone);
+        }
+
+        // Run hot_reload_materials_system once to initiate load
+        {
+            let session = game.sessions.get_mut("test").unwrap();
+            session.world.run_system(hot_reload_materials_system, ());
+        }
+
+        // Wait until AssetServer has loaded atoms.ron
+        {
+            let session = game.sessions.get_mut("test").unwrap();
+            let tracker = session.world.resource::<MaterialsAssetTracker>();
+            let server = session.world.resource::<AssetServer>();
+            let handle = tracker.handle;
+            let mut loaded = false;
+            for _ in 0..100 {
+                if server.try_get(handle).is_some() {
+                    loaded = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(loaded, "atoms.ron should be loaded by AssetServer");
+        }
+
+        // Run hot_reload_materials_system again to apply loaded materials
+        {
+            let session = game.sessions.get_mut("test").unwrap();
+            session.world.run_system(hot_reload_materials_system, ());
+            let mats = session.world.resource::<Materials>();
+            assert_eq!(mats.0.len(), 5);
+            assert_eq!(mats.0[4].inertial_resistance, 0.60);
+        }
+
+        // Now modify atoms.ron on disk with new values (inertial_resistance: 0.25)
+        let updated_ron = r#"([
+            (default_state: Void),
+            (default_state: Object),
+            (default_state: Powder, inertial_resistance: 0.1),
+            (default_state: Liquid, flow: 5),
+            (default_state: Powder, inertial_resistance: 0.25),
+        ])"#;
+        std::fs::write(&atoms_path, updated_ron).unwrap();
+
+        // Trigger change via server.load_asset_forced
+        {
+            let server = game.shared_resource::<AssetServer>();
+            let handle = server
+                .load_asset_forced(AssetLocRef {
+                    path: std::path::Path::new("atoms.ron"),
+                    pack: None,
+                })
+                .typed::<Materials>();
+
+            let mut reloaded = false;
+            for _ in 0..100 {
+                if let Some(Ok(mats)) = server.try_get(handle) {
+                    if mats.0.len() >= 5
+                        && (mats.0[4].inertial_resistance - 0.25).abs() < f32::EPSILON
+                    {
+                        reloaded = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(reloaded, "AssetServer should have loaded updated atoms.ron");
+        }
+
+        // Run hot_reload_materials_system in session world and verify materials updated
+        {
+            let session = game.sessions.get_mut("test").unwrap();
+            session.world.run_system(hot_reload_materials_system, ());
+            let mats = session.world.resource::<Materials>();
+            assert_eq!(mats.0.len(), 5);
+            assert_eq!(mats.0[4].inertial_resistance, 0.25);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+

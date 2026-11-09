@@ -5,17 +5,15 @@ pub mod chunk_group;
 pub mod consts;
 pub mod geom_tools;
 pub mod plugin;
-pub mod prefabs;
 pub mod rigidbody;
 pub mod world;
 pub mod world_store;
-pub mod worldgen;
 
 pub use world_store as storage;
 
 pub mod prelude {
     pub use crate::{
-        atom::*, ca::*, chunk::*, chunk_group::*, consts::*, geom_tools::*, plugin::*, prefabs::*,
+        atom::*, ca::*, chunk::*, chunk_group::*, consts::*, geom_tools::*, plugin::*,
         rigidbody::*, world::*, world_store::*,
     };
     pub use bones_framework::prelude::{

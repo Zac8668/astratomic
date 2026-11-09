@@ -8,7 +8,9 @@ use bones_framework::prelude::*;
 use crate::{
     meta::GameMeta,
     player::{AstratomicPlayerPlugin, LocalView},
+    prefabs::AstratomicPrefabsPlugin,
     ui::AstratomicDebugUiPlugin,
+    worldgen::AstratomicWorldgenPlugin,
 };
 
 /// Named session identifiers (following Jumpy's session convention).
@@ -26,7 +28,10 @@ impl GamePlugin for AstratomicGamePlugin {
         // Initialize the asset server and register built-in + game schemas.
         game.init_shared_resource::<AssetServer>()
             .register_default_assets();
+        astratomic_sim::plugin::register_sim_schemas();
         GameMeta::register_schema();
+        game.install_plugin(AstratomicWorldgenPlugin);
+        game.install_plugin(AstratomicPrefabsPlugin);
         game.install_plugin(AstratomicSimPlugin);
         game.install_plugin(AstratomicPhysicsPlugin);
         game.install_plugin(AstratomicPlayerPlugin);
@@ -45,7 +50,9 @@ pub fn world_session_plugin(session: &mut Session) {
     register_physics_schemas();
     session
         .install_plugin(DefaultSessionPlugin)
+        .install_plugin(AstratomicWorldgenPlugin)
         .install_plugin(AstratomicSimPlugin)
+        .install_plugin(AstratomicPrefabsPlugin)
         .install_plugin(AstratomicPlayerPlugin)
         .install_plugin(AstratomicRenderPlugin)
         .install_plugin(AstratomicDebugUiPlugin)

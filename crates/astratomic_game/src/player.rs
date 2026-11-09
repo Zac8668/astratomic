@@ -4,7 +4,8 @@
 use std::collections::HashSet;
 
 use astratomic_physics::prelude::{
-    ActorState, KinematicActor, find_surface_spawn_pos, kinematic_actor_movement_system,
+    ActorSimulationStamp, ActorState, KinematicActor, clear_actor_objects_system,
+    find_surface_spawn_pos, kinematic_actor_movement_system, stamp_actor_objects_system,
     world_cell_to_global_atom,
 };
 pub use astratomic_sim::consts::PLAYER_STEP_HEIGHT;
@@ -62,16 +63,7 @@ pub struct PlayerControlled {
 ///
 /// Simulation systems must ONLY read [`MatchInputs`] and NEVER read raw `winit` keyboard/mouse
 /// resources directly.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    bytemuck::Pod,
-    bytemuck::Zeroable,
-    HasSchema,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable, HasSchema)]
 #[schema(opaque)]
 #[repr(C)]
 pub struct PlayerInput {
@@ -186,13 +178,16 @@ impl SessionPlugin for AstratomicPlayerPlugin {
         session.world.init_resource::<MatchInputs>();
         session.world.init_resource::<LocalView>();
         session.world.init_resource::<LocalInputState>();
+        session.world.init_resource::<ActorSimulationStamp>();
 
         session
             .add_system_to_stage(CoreStage::Startup, setup_player_system)
             .add_system_to_stage(CoreStage::PreUpdate, gather_local_player_input_system)
-            .add_system_to_stage(CoreStage::Update, player_controller_system)
-            .add_system_to_stage(CoreStage::Update, kinematic_actor_movement_system)
-            .add_system_to_stage(CoreStage::Update, player_world_action_system)
+            .add_system_to_stage(CoreStage::PreUpdate, player_controller_system)
+            .add_system_to_stage(CoreStage::PreUpdate, kinematic_actor_movement_system)
+            .add_system_to_stage(CoreStage::PreUpdate, player_world_action_system)
+            .add_system_to_stage(CoreStage::PreUpdate, stamp_actor_objects_system)
+            .add_system_to_stage(CoreStage::Update, clear_actor_objects_system)
             .add_system_to_stage(CoreStage::PostUpdate, update_local_view_camera_system)
             .add_system_to_stage(CoreStage::PostUpdate, sync_player_visuals_system);
     }
@@ -394,16 +389,10 @@ pub fn gather_local_player_input_system(
         if win.size.x <= 1.0 || win.size.y <= 1.0 {
             return None;
         }
-        let ndc = Vec2::new(
-            (screen.x / win.size.x) - 0.5,
-            0.5 - (screen.y / win.size.y),
-        );
+        let ndc = Vec2::new((screen.x / win.size.x) - 0.5, 0.5 - (screen.y / win.size.y));
         let aspect = win.size.x / win.size.y;
         let view_height = 420.0;
-        Some(
-            local_view.camera_pos
-                + Vec2::new(ndc.x * view_height * aspect, ndc.y * view_height),
-        )
+        Some(local_view.camera_pos + Vec2::new(ndc.x * view_height * aspect, ndc.y * view_height))
     });
 
     if let Some(target_world) = cursor_world {
@@ -566,8 +555,7 @@ pub fn player_world_action_system(
         if input.pressed(BTN_PRIMARY) {
             let start_world = actor.pos + aim * 4.0;
             let end_world = actor.pos + aim * 24.0;
-            let start_cell =
-                ivec2(start_world.x.floor() as i32, start_world.y.floor() as i32);
+            let start_cell = ivec2(start_world.x.floor() as i32, start_world.y.floor() as i32);
             let end_cell = ivec2(end_world.x.floor() as i32, end_world.y.floor() as i32);
 
             for cell in Line::points_inclusive(start_cell, end_cell) {

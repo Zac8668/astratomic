@@ -313,8 +313,10 @@ dependencies = [
  "bones_schema",
  "bones_wgpu_renderer",
  "bytemuck",
+ "fastnoise-lite",
  "fastrand 2.5.0",
  "glam 0.24.2",
+ "image 0.24.9",
  "ron",
  "serde",
  "thiserror 2.0.21",
@@ -355,6 +357,7 @@ dependencies = [
 name = "astratomic_sim"
 version = "0.3.0"
 dependencies = [
+ "bevy_tasks",
  "bitcode",
  "bones_asset",
  "bones_ecs",
@@ -364,7 +367,6 @@ dependencies = [
  "bytemuck",
  "contour",
  "crossbeam-channel",
- "fastnoise-lite",
  "fastrand 2.5.0",
  "geo",
  "glam 0.24.2",
@@ -376,6 +378,7 @@ dependencies = [
  "ron",
  "serde",
  "thiserror 2.0.21",
+ "tracing",
  "zstd",
 ]
 

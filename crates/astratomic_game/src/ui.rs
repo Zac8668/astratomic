@@ -8,16 +8,22 @@ use astratomic_sim::{
     atom::{Atom, Materials},
     chunk::CHUNK_SIZE,
     geom_tools::{Line, circle_points, square_points},
-    prefabs::{PendingPrefabStamps, PrefabConfigs, PrefabPlaced, stamp_prefab_manual},
     world::{
-        ChunkWorld, DirtyRects, Generator, SimulationSettings, global_to_chunk,
+        ChunkGeneratorHook, ChunkWorld, DirtyRects, SimulationSettings, global_to_chunk,
         world_to_global_atom,
     },
     world_store::WorldIoWorker,
 };
 use bones_framework::prelude::*;
 
-use crate::player::{LocalInputState, LocalView, MatchInputs, PlayerControlled};
+use crate::{
+    player::{LocalInputState, LocalView, MatchInputs, PlayerControlled},
+    prefabs::{
+        PendingPrefabStamps, PrefabConfigs, PrefabPlaced, stamp_initial_window_prefabs,
+        stamp_prefab_manual,
+    },
+    worldgen::Generator,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, HasSchema)]
 #[repr(u8)]
@@ -244,8 +250,7 @@ pub fn camera_control_system(
             if ctrl.player_id == local_view.local_player_id
                 && let Some(actor) = actors.get_mut(ent)
             {
-                let spawn_pos =
-                    find_surface_spawn_pos(&chunk_world, actor.pos.x, actor.half_size);
+                let spawn_pos = find_surface_spawn_pos(&chunk_world, actor.pos.x, actor.half_size);
                 actor.pos = spawn_pos;
                 actor.prev_pos = spawn_pos;
                 actor.vel = Vec2::ZERO;
@@ -661,6 +666,7 @@ pub fn debug_ui_system(
     local_view: Res<LocalView>,
     mut local_input: Option<ResMut<LocalInputState>>,
     mut generator: ResMut<Generator>,
+    mut generator_hook: Option<ResMut<ChunkGeneratorHook>>,
     mut sim_settings: ResMut<SimulationSettings>,
     mut chunk_world: ResMut<ChunkWorld>,
     mut dirty_rects: ResMut<DirtyRects>,
@@ -1017,7 +1023,12 @@ pub fn debug_ui_system(
                             .text("Cave Surface Fade"),
                     );
                     ui.add(
-                        egui::Slider::new(&mut draft.ore_richness, 0.0..=3.0).text("Ore Richness"),
+                        egui::Slider::new(&mut draft.ore_richness, 0.0..=5.0)
+                            .text("Ore Richness (Quantity)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut draft.ore_blob_size, 0.2..=5.0)
+                            .text("Ore Blob Size"),
                     );
 
                     ui.horizontal(|ui| {
@@ -1028,13 +1039,23 @@ pub fn debug_ui_system(
 
                     if ui.button("🔄 Regenerate Active Window").clicked() {
                         *generator = state.gen_draft;
+                        let hook = generator.create_hook();
+                        if let Some(ref mut gh) = generator_hook {
+                            **gh = hook.clone();
+                        }
                         chunk_world.regenerate_window(
                             &materials,
-                            &generator,
+                            &hook,
+                            &mut dirty_rects,
+                        );
+                        stamp_initial_window_prefabs(
+                            &mut chunk_world,
+                            &mut dirty_rects,
                             &mut prefab_configs,
                             &mut prefab_placed,
                             &mut pending_stamps,
-                            &mut dirty_rects,
+                            &materials,
+                            generator.seed,
                         );
                     }
                 });

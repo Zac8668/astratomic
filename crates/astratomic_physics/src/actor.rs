@@ -2,9 +2,13 @@
 //! and AABB grid-sweep collision over [`ChunkWorld`].
 
 use astratomic_sim::{
+    atom::{Atom, AtomState},
     chunk::CHUNK_SIZE,
     consts::{FUEL_MAX, PLAYER_STEP_HEIGHT},
-    world::{ChunkWorld, SimulationSettings, global_to_chunk},
+    world::{
+        ChunkPos, ChunkWorld, DirtyRects, SimulationSettings, global_to_chunk,
+        update_dirty_rects_3x3,
+    },
 };
 use bones_framework::prelude::*;
 
@@ -139,6 +143,59 @@ pub fn aabb_has_solid(
     false
 }
 
+/// Tests whether any cell in columns `wx_start..=wx_end` and rows `wy_start..=wy_end` contains
+/// a solid or powder atom.
+#[inline]
+pub fn cells_have_solid(
+    chunk_world: &ChunkWorld,
+    wx_start: i32,
+    wx_end: i32,
+    wy_start: i32,
+    wy_end: i32,
+) -> bool {
+    for wy in wy_start..=wy_end {
+        for wx in wx_start..=wx_end {
+            if is_world_cell_solid(chunk_world, wx, wy) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Finds the first solid obstacle column in `start_wx..=end_wx` when sweeping horizontally.
+///
+/// If `moving_right` is true, scans `start_wx..=end_wx` ascending and returns the first column with solid atoms.
+/// If `moving_right` is false, scans `start_wx..=end_wx` descending and returns the first column with solid atoms.
+#[inline]
+pub fn find_horizontal_hit_column(
+    chunk_world: &ChunkWorld,
+    start_wx: i32,
+    end_wx: i32,
+    wy_start: i32,
+    wy_end: i32,
+    moving_right: bool,
+) -> Option<i32> {
+    if moving_right {
+        for wx in start_wx..=end_wx {
+            for wy in wy_start..=wy_end {
+                if is_world_cell_solid(chunk_world, wx, wy) {
+                    return Some(wx);
+                }
+            }
+        }
+    } else {
+        for wx in (start_wx..=end_wx).rev() {
+            for wy in wy_start..=wy_end {
+                if is_world_cell_solid(chunk_world, wx, wy) {
+                    return Some(wx);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Estimates the upward ground normal (`+Y` up) beneath an actor's feet by sampling surface
 /// heights across the left and right edges of the footprint.
 pub fn estimate_ground_normal(
@@ -213,6 +270,9 @@ pub fn find_surface_spawn_pos(chunk_world: &ChunkWorld, world_x: f32, half_size:
 /// Steps a single [`KinematicActor`] (and optional [`ActorState`]) through [`ChunkWorld`]
 /// using the exact Step A (horizontal sweep + foot inset + auto-step-up) and Step B (vertical sweep)
 /// rules.
+///
+/// Leading-edge sweeps and non-inverting clamps guarantee that overlapping atoms inside an actor's
+/// body never cause reverse-direction movement or teleports.
 pub fn step_kinematic_actor(
     chunk_world: &ChunkWorld,
     actor: &mut KinematicActor,
@@ -233,26 +293,45 @@ pub fn step_kinematic_actor(
     if dx.abs() > 0.0 {
         let substeps = dx.abs().ceil().max(1.0) as i32;
         let step_dx = dx / substeps as f32;
+        let moving_right = step_dx > 0.0;
 
         for _ in 0..substeps {
             let new_x = actor.pos.x + step_dx;
             let bottom = actor.pos.y - half_h;
             let top = actor.pos.y + half_h;
 
-            let new_left = new_x - half_w + SKIN;
-            let new_right = new_x + half_w - SKIN;
-
-            // Test upper body from `bottom + step_height` to `top` first.
             let upper_bottom = (bottom + step_h_f32).min(top - SKIN * 2.0) + SKIN;
             let upper_top = top - SKIN;
+            let feet_bottom = bottom + SKIN;
+            let feet_top = (bottom + step_h_f32).min(top) - SKIN;
+
+            let upper_y0 = upper_bottom.floor() as i32;
+            let upper_y1 = upper_top.floor() as i32;
+            let feet_y0 = feet_bottom.floor() as i32;
+            let feet_y1 = feet_top.floor() as i32;
+
+            let (lead_wx_start, lead_wx_end) = if moving_right {
+                let start = (actor.pos.x + half_w - SKIN).floor() as i32;
+                let end = (new_x + half_w - SKIN).floor() as i32;
+                (start, end)
+            } else {
+                let start = (new_x - half_w + SKIN).floor() as i32;
+                let end = (actor.pos.x - half_w + SKIN).floor() as i32;
+                (start, end)
+            };
+
             let upper_clear =
-                !aabb_has_solid(chunk_world, new_left, new_right, upper_bottom, upper_top);
+                !cells_have_solid(chunk_world, lead_wx_start, lead_wx_end, upper_y0, upper_y1);
 
             if upper_clear {
-                // Check the feet region (`bottom .. bottom + step_height`).
-                let feet_top = (bottom + step_h_f32).min(top) - SKIN;
                 let feet_has_solid = step_height > 0
-                    && aabb_has_solid(chunk_world, new_left, new_right, bottom + SKIN, feet_top);
+                    && cells_have_solid(
+                        chunk_world,
+                        lead_wx_start,
+                        lead_wx_end,
+                        feet_y0,
+                        feet_y1,
+                    );
 
                 if !feet_has_solid {
                     actor.pos.x = new_x;
@@ -262,12 +341,12 @@ pub fn step_kinematic_actor(
                     let mut stepped_up = false;
                     for h in 1..=step_height {
                         let candidate_y = actor.pos.y + h as f32;
-                        let cand_bottom = candidate_y - half_h + SKIN;
-                        let cand_top = candidate_y + half_h - SKIN;
-                        if !aabb_has_solid(
+                        let cand_bottom = (candidate_y - half_h + SKIN).floor() as i32;
+                        let cand_top = (candidate_y + half_h - SKIN).floor() as i32;
+                        if !cells_have_solid(
                             chunk_world,
-                            new_left,
-                            new_right,
+                            lead_wx_start,
+                            lead_wx_end,
                             cand_bottom,
                             cand_top,
                         ) {
@@ -279,12 +358,48 @@ pub fn step_kinematic_actor(
                     }
 
                     if !stepped_up {
-                        snap_horizontal_obstacle(chunk_world, actor, new_x, step_dx > 0.0);
+                        let full_y0 = feet_y0;
+                        let full_y1 = upper_y1;
+                        if let Some(hit_wx) = find_horizontal_hit_column(
+                            chunk_world,
+                            lead_wx_start,
+                            lead_wx_end,
+                            full_y0,
+                            full_y1,
+                            moving_right,
+                        ) {
+                            if moving_right {
+                                let snapped = (hit_wx as f32) - half_w - SKIN;
+                                actor.pos.x = snapped.max(actor.pos.x);
+                            } else {
+                                let snapped = ((hit_wx + 1) as f32) + half_w + SKIN;
+                                actor.pos.x = snapped.min(actor.pos.x);
+                            }
+                        }
+                        actor.vel.x = 0.0;
                         break;
                     }
                 }
             } else {
-                snap_horizontal_obstacle(chunk_world, actor, new_x, step_dx > 0.0);
+                let full_y0 = feet_y0;
+                let full_y1 = upper_y1;
+                if let Some(hit_wx) = find_horizontal_hit_column(
+                    chunk_world,
+                    lead_wx_start,
+                    lead_wx_end,
+                    full_y0,
+                    full_y1,
+                    moving_right,
+                ) {
+                    if moving_right {
+                        let snapped = (hit_wx as f32) - half_w - SKIN;
+                        actor.pos.x = snapped.max(actor.pos.x);
+                    } else {
+                        let snapped = ((hit_wx + 1) as f32) + half_w + SKIN;
+                        actor.pos.x = snapped.min(actor.pos.x);
+                    }
+                }
+                actor.vel.x = 0.0;
                 break;
             }
         }
@@ -296,6 +411,8 @@ pub fn step_kinematic_actor(
     let dy = actor.vel.y;
     let inset_left = actor.pos.x - half_w + SKIN;
     let inset_right = actor.pos.x + half_w - SKIN;
+    let x0 = inset_left.floor() as i32;
+    let x1 = inset_right.floor() as i32;
     let mut hit_floor = false;
 
     if dy.abs() > 0.0 {
@@ -304,25 +421,54 @@ pub fn step_kinematic_actor(
 
         for _ in 0..substeps {
             let new_y = actor.pos.y + step_dy;
-            let new_bottom = new_y - half_h + SKIN;
-            let new_top = new_y + half_h - SKIN;
 
-            if !aabb_has_solid(chunk_world, inset_left, inset_right, new_bottom, new_top) {
-                actor.pos.y = new_y;
-            } else {
-                if step_dy < 0.0 {
-                    // Falling (`-Y`) -> floor hit.
-                    let wy = new_bottom.floor() as i32;
-                    actor.pos.y = ((wy + 1) as f32) + half_h + SKIN;
+            if step_dy < 0.0 {
+                // Falling (`-Y`) -> leading edge is bottom.
+                let lead_wy_start = (new_y - half_h + SKIN).floor() as i32;
+                let lead_wy_end = (actor.pos.y - half_h + SKIN).floor() as i32;
+
+                let mut hit_wy = None;
+                'search_down: for wy in (lead_wy_start..=lead_wy_end).rev() {
+                    for wx in x0..=x1 {
+                        if is_world_cell_solid(chunk_world, wx, wy) {
+                            hit_wy = Some(wy);
+                            break 'search_down;
+                        }
+                    }
+                }
+
+                if let Some(wy) = hit_wy {
+                    let snapped = ((wy + 1) as f32) + half_h + SKIN;
+                    actor.pos.y = snapped.min(actor.pos.y);
                     actor.vel.y = 0.0;
                     hit_floor = true;
+                    break;
                 } else {
-                    // Jumping (`+Y`) -> ceiling hit.
-                    let wy = new_top.floor() as i32;
-                    actor.pos.y = (wy as f32) - half_h - SKIN;
-                    actor.vel.y = 0.0;
+                    actor.pos.y = new_y;
                 }
-                break;
+            } else {
+                // Jumping (`+Y`) -> leading edge is top.
+                let lead_wy_start = (actor.pos.y + half_h - SKIN).floor() as i32;
+                let lead_wy_end = (new_y + half_h - SKIN).floor() as i32;
+
+                let mut hit_wy = None;
+                'search_up: for wy in lead_wy_start..=lead_wy_end {
+                    for wx in x0..=x1 {
+                        if is_world_cell_solid(chunk_world, wx, wy) {
+                            hit_wy = Some(wy);
+                            break 'search_up;
+                        }
+                    }
+                }
+
+                if let Some(wy) = hit_wy {
+                    let snapped = (wy as f32) - half_h - SKIN;
+                    actor.pos.y = snapped.max(actor.pos.y);
+                    actor.vel.y = 0.0;
+                    break;
+                } else {
+                    actor.pos.y = new_y;
+                }
             }
         }
     }
@@ -332,7 +478,13 @@ pub fn step_kinematic_actor(
     if !hit_floor && actor.vel.y <= 0.0 {
         let probe_bottom = (actor.pos.y - half_h) - (SKIN * 4.0);
         let probe_top = (actor.pos.y - half_h) - (SKIN * 0.5);
-        if aabb_has_solid(chunk_world, inset_left, inset_right, probe_bottom, probe_top) {
+        if aabb_has_solid(
+            chunk_world,
+            inset_left,
+            inset_right,
+            probe_bottom,
+            probe_top,
+        ) {
             hit_floor = true;
         }
     }
@@ -369,51 +521,6 @@ pub fn step_kinematic_actor(
     }
 }
 
-/// Snaps `actor.pos.x` to the exact obstacle face (`±SKIN`) using `.floor() as i32` and zeroes `vel.x`.
-fn snap_horizontal_obstacle(
-    chunk_world: &ChunkWorld,
-    actor: &mut KinematicActor,
-    attempted_x: f32,
-    moving_right: bool,
-) {
-    let half_w = actor.half_size.x.max(0.5);
-    let half_h = actor.half_size.y.max(0.5);
-    let bottom = actor.pos.y - half_h + SKIN;
-    let top = actor.pos.y + half_h - SKIN;
-    let y0 = bottom.floor() as i32;
-    let y1 = top.floor() as i32;
-
-    if moving_right {
-        let start_wx = (actor.pos.x + half_w - SKIN).floor() as i32;
-        let end_wx = (attempted_x + half_w - SKIN).floor() as i32;
-        let mut hit_wx = end_wx;
-        'search_right: for wx in start_wx..=end_wx {
-            for wy in y0..=y1 {
-                if is_world_cell_solid(chunk_world, wx, wy) {
-                    hit_wx = wx;
-                    break 'search_right;
-                }
-            }
-        }
-        actor.pos.x = (hit_wx as f32) - half_w - SKIN;
-    } else {
-        let start_wx = (attempted_x - half_w + SKIN).floor() as i32;
-        let end_wx = (actor.pos.x - half_w + SKIN).floor() as i32;
-        let mut hit_wx = start_wx;
-        'search_left: for wx in (start_wx..=end_wx).rev() {
-            for wy in y0..=y1 {
-                if is_world_cell_solid(chunk_world, wx, wy) {
-                    hit_wx = wx;
-                    break 'search_left;
-                }
-            }
-        }
-        actor.pos.x = ((hit_wx + 1) as f32) + half_w + SKIN;
-    }
-
-    actor.vel.x = 0.0;
-}
-
 /// Deterministic [`KinematicActor`] grid sweep system reading `Res<ChunkWorld>`.
 pub fn kinematic_actor_movement_system(
     sim_settings: Option<Res<SimulationSettings>>,
@@ -438,6 +545,82 @@ pub fn kinematic_actor_movement_system(
         };
         let state = states.get_mut(ent);
         step_kinematic_actor(&chunk_world, actor, state);
+    }
+}
+
+/// Tracks cells in [`ChunkWorld`] where temporary [`AtomState::Object`] atoms were placed
+/// for [`KinematicActor`] footprints so that cellular automata particles cannot pass through them.
+#[derive(HasSchema, Clone, Debug, Default)]
+pub struct ActorSimulationStamp {
+    pub stamped_atoms: Vec<(ChunkPos, Atom)>,
+}
+
+/// Stamps temporary [`AtomState::Object`] atoms across the footprints of all [`KinematicActor`] entities
+/// before cellular automata simulation runs, preventing falling sand and liquids from passing through actors.
+pub fn stamp_actor_objects_system(
+    sim_settings: Option<Res<SimulationSettings>>,
+    mut chunk_world: ResMut<ChunkWorld>,
+    mut stamp: ResMut<ActorSimulationStamp>,
+    mut dirty_rects: ResMut<DirtyRects>,
+    entities: Res<Entities>,
+    actors: Comp<KinematicActor>,
+) {
+    if sim_settings
+        .as_ref()
+        .is_some_and(|s| s.paused && !s.step_once)
+    {
+        return;
+    }
+
+    stamp.stamped_atoms.clear();
+
+    for (_ent, actor) in entities.iter_with(&actors) {
+        let half_w = actor.half_size.x.max(0.5);
+        let half_h = actor.half_size.y.max(0.5);
+
+        let min_x = actor.pos.x - half_w + SKIN;
+        let max_x = actor.pos.x + half_w - SKIN;
+        let min_y = actor.pos.y - half_h + SKIN;
+        let max_y = actor.pos.y + half_h - SKIN;
+
+        let x0 = min_x.floor() as i32;
+        let x1 = max_x.floor() as i32;
+        let y0 = min_y.floor() as i32;
+        let y1 = max_y.floor() as i32;
+
+        for wy in y0..=y1 {
+            for wx in x0..=x1 {
+                let global = world_cell_to_global_atom(wx, wy);
+                let chunk_pos = global_to_chunk(global);
+
+                if let Some(atom) = chunk_world.get_atom(&chunk_pos) {
+                    if atom.is_void() {
+                        let original = *atom;
+                        let object_atom = Atom::with_state(1, AtomState::Object, [0, 0, 0, 0]);
+                        chunk_world.set_atom(chunk_pos, object_atom);
+                        stamp.stamped_atoms.push((chunk_pos, original));
+                        update_dirty_rects_3x3(&mut dirty_rects.current, chunk_pos);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Cleans up temporary [`AtomState::Object`] atoms after cellular automata simulation runs,
+/// restoring the cells back to their original state and waking up surrounding cells.
+pub fn clear_actor_objects_system(
+    mut chunk_world: ResMut<ChunkWorld>,
+    mut stamp: ResMut<ActorSimulationStamp>,
+    mut dirty_rects: ResMut<DirtyRects>,
+) {
+    for (chunk_pos, original) in stamp.stamped_atoms.drain(..) {
+        if let Some(atom) = chunk_world.get_atom(&chunk_pos) {
+            if atom.is_object() {
+                chunk_world.set_atom(chunk_pos, original);
+                update_dirty_rects_3x3(&mut dirty_rects.current, chunk_pos);
+            }
+        }
     }
 }
 
@@ -553,5 +736,328 @@ mod tests {
             "wall taller than PLAYER_STEP_HEIGHT must block horizontal motion"
         );
         assert!((actor.pos.x - (12.0 - 3.0 - SKIN)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn actor_overlapping_atoms_never_moves_in_reverse_direction() {
+        let mut world = world_with_flat_floor(-1);
+        let rock = Atom::with_state(8, AtomState::Solid, [128, 128, 128, 255]);
+
+        // Place solid atoms on the left at wx = 7, 8 (wy from 0 to 10).
+        for wx in 7..=8 {
+            for wy in 0..=10 {
+                let cp = global_to_chunk(world_cell_to_global_atom(wx, wy));
+                world.set_atom(cp, rock);
+            }
+        }
+
+        // Actor at x = 10.0, half_w = 3.0.
+        // Left edge is at x = 7.001, so it overlaps wx = 7 and 8!
+        let mut actor = KinematicActor {
+            pos: Vec2::new(10.0, 6.0 + SKIN),
+            prev_pos: Vec2::new(10.0, 6.0 + SKIN),
+            vel: Vec2::new(2.0, 0.0), // Moving right (away from the atoms on the left)
+            half_size: Vec2::new(3.0, 6.0),
+            step_height: PLAYER_STEP_HEIGHT,
+            grounded: true,
+            ground_normal: Vec2::Y,
+        };
+
+        // When moving right: actor MUST move right and NOT snap to the left!
+        step_kinematic_actor(&world, &mut actor, None);
+        assert!(
+            actor.pos.x > 10.0,
+            "moving right away from atoms must increase pos.x, got pos.x = {}",
+            actor.pos.x
+        );
+
+        // Reset to x = 10.0 and test moving left (into the atoms):
+        actor.pos = Vec2::new(10.0, 6.0 + SKIN);
+        actor.vel = Vec2::new(-2.0, 0.0);
+        step_kinematic_actor(&world, &mut actor, None);
+        assert!(
+            actor.pos.x <= 10.0,
+            "moving left into atoms must never snap backwards to the right! got pos.x = {}",
+            actor.pos.x
+        );
+
+        // Symmetrically: place atoms on the right at wx = 12, 13
+        for wx in 12..=13 {
+            for wy in 0..=10 {
+                let cp = global_to_chunk(world_cell_to_global_atom(wx, wy));
+                world.set_atom(cp, rock);
+            }
+        }
+
+        // Actor at x = 10.0. Right edge is at 12.999, overlapping wx = 12.
+        actor.pos = Vec2::new(10.0, 6.0 + SKIN);
+        actor.vel = Vec2::new(-2.0, 0.0); // Moving left (away from atoms on right)
+        // Clear wx = 7, 8 so left is open
+        for wx in 7..=8 {
+            for wy in 0..=10 {
+                let cp = global_to_chunk(world_cell_to_global_atom(wx, wy));
+                world.set_atom(cp, Atom::default());
+            }
+        }
+
+        step_kinematic_actor(&world, &mut actor, None);
+        assert!(
+            actor.pos.x < 10.0,
+            "moving left away from atoms on the right must decrease pos.x, got pos.x = {}",
+            actor.pos.x
+        );
+
+        // Reset to x = 10.0 and test moving right (into the atoms on right):
+        actor.pos = Vec2::new(10.0, 6.0 + SKIN);
+        actor.vel = Vec2::new(2.0, 0.0);
+        step_kinematic_actor(&world, &mut actor, None);
+        assert!(
+            actor.pos.x >= 10.0,
+            "moving right into atoms must never snap backwards to the left! got pos.x = {}",
+            actor.pos.x
+        );
+    }
+
+    #[test]
+    fn actor_jumping_with_atoms_around_feet_moves_upward() {
+        let mut world = world_with_flat_floor(-1);
+        let rock = Atom::with_state(8, AtomState::Solid, [128, 128, 128, 255]);
+
+        // Place atoms around the actor's feet (wy = 0..=2)
+        for wx in -3..=3 {
+            for wy in 0..=2 {
+                let cp = global_to_chunk(world_cell_to_global_atom(wx, wy));
+                world.set_atom(cp, rock);
+            }
+        }
+
+        let mut actor = KinematicActor {
+            pos: Vec2::new(0.0, 6.0 + SKIN),
+            prev_pos: Vec2::new(0.0, 6.0 + SKIN),
+            vel: Vec2::new(0.0, 3.0),
+            half_size: Vec2::new(3.0, 6.0),
+            step_height: PLAYER_STEP_HEIGHT,
+            grounded: true,
+            ground_normal: Vec2::Y,
+        };
+
+        step_kinematic_actor(&world, &mut actor, None);
+        assert!(
+            actor.pos.y > 6.0 + SKIN,
+            "jumping upward with atoms at feet must increase pos.y, got {}",
+            actor.pos.y
+        );
+    }
+
+    #[test]
+    fn actor_simulation_stamp_and_clear_cycle() {
+        crate::plugin::register_physics_schemas();
+        let world = World::new();
+        let mut chunk_world = ChunkWorld::default();
+        chunk_world.add_chunk(ivec2(0, 0), Chunk::default());
+        chunk_world.add_chunk(ivec2(0, -1), Chunk::default());
+
+        world.insert_resource(chunk_world);
+        world.insert_resource(DirtyRects::default());
+        world.insert_resource(ActorSimulationStamp::default());
+
+        let ent = world.resource_mut::<Entities>().create();
+        world.component_mut::<KinematicActor>().insert(
+            ent,
+            KinematicActor {
+                pos: Vec2::new(5.0, 5.0),
+                prev_pos: Vec2::new(5.0, 5.0),
+                vel: Vec2::ZERO,
+                half_size: Vec2::new(2.0, 3.0),
+                step_height: 3,
+                grounded: false,
+                ground_normal: Vec2::Y,
+            },
+        );
+
+        world.run_system(stamp_actor_objects_system, ());
+
+        {
+            let stamp = world.resource::<ActorSimulationStamp>();
+            assert!(!stamp.stamped_atoms.is_empty(), "should have stamped cells for the actor");
+            let cw = world.resource::<ChunkWorld>();
+            let sample_cp = global_to_chunk(world_cell_to_global_atom(5, 5));
+            let atom = cw.get_atom(&sample_cp).unwrap();
+            assert!(
+                atom.is_object(),
+                "stamped cell must have AtomState::Object, got {:?}",
+                atom.state()
+            );
+        }
+
+        world.run_system(clear_actor_objects_system, ());
+
+        {
+            let stamp = world.resource::<ActorSimulationStamp>();
+            assert!(stamp.stamped_atoms.is_empty(), "stamp should be drained");
+            let cw = world.resource::<ChunkWorld>();
+            let sample_cp = global_to_chunk(world_cell_to_global_atom(5, 5));
+            let atom = cw.get_atom(&sample_cp).unwrap();
+            assert!(
+                atom.is_void(),
+                "cleared cell must be restored to Void, got {:?}",
+                atom.state()
+            );
+        }
+    }
+
+    #[test]
+    fn falling_powder_cannot_penetrate_actor_when_stamped() {
+        use astratomic_sim::{atom::Materials, ca::step_chunk_simulation, world::URect};
+
+        crate::plugin::register_physics_schemas();
+        astratomic_sim::plugin::register_sim_schemas();
+
+        let world = World::new();
+        let mut chunk_world = ChunkWorld::default();
+        for cy in -2..=2 {
+            for cx in -2..=2 {
+                chunk_world.add_chunk(ivec2(cx, cy), Chunk::default());
+            }
+        }
+
+        world.insert_resource(chunk_world);
+        world.insert_resource(DirtyRects::default());
+        world.insert_resource(ActorSimulationStamp::default());
+        world.insert_resource(Materials::default_builtin());
+
+        // Actor at x = 5.0, y = 5.0, half_size = 2.0, 3.0 (spans y in 2.0..=8.0, x in 3.0..=7.0)
+        let ent = world.resource_mut::<Entities>().create();
+        world.component_mut::<KinematicActor>().insert(
+            ent,
+            KinematicActor {
+                pos: Vec2::new(5.0, 5.0),
+                prev_pos: Vec2::new(5.0, 5.0),
+                vel: Vec2::ZERO,
+                half_size: Vec2::new(2.0, 3.0),
+                step_height: 3,
+                grounded: false,
+                ground_normal: Vec2::Y,
+            },
+        );
+
+        // Stamp Object atoms for the actor
+        world.run_system(stamp_actor_objects_system, ());
+
+        // Place sand atom at world cell (5, 8), directly above actor's head (wy = 7)
+        let sand = Atom::with_state(2, AtomState::Powder, [230, 197, 92, 255]);
+        let sand_cp = global_to_chunk(world_cell_to_global_atom(5, 8));
+        world.resource_mut::<ChunkWorld>().set_atom(sand_cp, sand);
+        world.resource_mut::<DirtyRects>().current.insert(sand_cp.chunk, URect::full_chunk());
+
+        // Step simulation: sand tries to fall under gravity towards the actor's head (wy = 7)
+        {
+            let mut cw = world.resource_mut::<ChunkWorld>();
+            let mut dr = world.resource_mut::<DirtyRects>();
+            let mats = world.resource::<Materials>();
+            step_chunk_simulation(&mut cw, &mut dr, &mats);
+        }
+
+        // Verify that the actor's body cells (wy in 2..=7) do NOT contain sand
+        {
+            let cw = world.resource::<ChunkWorld>();
+            for wy in 2..=7 {
+                let cp = global_to_chunk(world_cell_to_global_atom(5, wy));
+                let atom = cw.get_atom(&cp).unwrap();
+                assert!(
+                    !atom.is_powder(),
+                    "sand must not fall through the actor! Cell at wy = {} is powder",
+                    wy
+                );
+            }
+        }
+
+        // Clear object atoms
+        world.run_system(clear_actor_objects_system, ());
+
+        let cw = world.resource::<ChunkWorld>();
+        for wy in 2..=7 {
+            let cp = global_to_chunk(world_cell_to_global_atom(5, wy));
+            let atom = cw.get_atom(&cp).unwrap();
+            assert!(atom.is_void(), "actor cells must be restored to Void");
+        }
+    }
+
+    #[test]
+    fn fluids_can_pass_through_actor_when_stamped() {
+        use astratomic_sim::{atom::Materials, ca::step_chunk_simulation, world::URect};
+
+        crate::plugin::register_physics_schemas();
+        astratomic_sim::plugin::register_sim_schemas();
+
+        let world = World::new();
+        let mut chunk_world = ChunkWorld::default();
+        for cy in -2..=2 {
+            for cx in -2..=2 {
+                chunk_world.add_chunk(ivec2(cx, cy), Chunk::default());
+            }
+        }
+
+        world.insert_resource(chunk_world);
+        world.insert_resource(DirtyRects::default());
+        world.insert_resource(ActorSimulationStamp::default());
+        world.insert_resource(Materials::default_builtin());
+
+        // Actor at x = 5.0, y = 5.0, half_size = 2.0, 3.0 (spans y in 2.0..=8.0, x in 3.0..=7.0)
+        let ent = world.resource_mut::<Entities>().create();
+        world.component_mut::<KinematicActor>().insert(
+            ent,
+            KinematicActor {
+                pos: Vec2::new(5.0, 5.0),
+                prev_pos: Vec2::new(5.0, 5.0),
+                vel: Vec2::ZERO,
+                half_size: Vec2::new(2.0, 3.0),
+                step_height: 3,
+                grounded: false,
+                ground_normal: Vec2::Y,
+            },
+        );
+
+        // Stamp Object atoms for the actor
+        world.run_system(stamp_actor_objects_system, ());
+
+        // Place water atom at world cell (5, 8), directly above actor's head (wy = 7)
+        let water = Atom::with_state(3, AtomState::Liquid, [40, 100, 220, 255]);
+        let water_cp = global_to_chunk(world_cell_to_global_atom(5, 8));
+        world.resource_mut::<ChunkWorld>().set_atom(water_cp, water);
+        world
+            .resource_mut::<DirtyRects>()
+            .current
+            .insert(water_cp.chunk, URect::full_chunk());
+
+        // Step simulation: water falls under gravity and should enter the actor's stamped space at wy = 7
+        {
+            let mut cw = world.resource_mut::<ChunkWorld>();
+            let mut dr = world.resource_mut::<DirtyRects>();
+            let mats = world.resource::<Materials>();
+            step_chunk_simulation(&mut cw, &mut dr, &mats);
+        }
+
+        // Verify that the water has entered the actor's footprint (wy in 2..=7)
+        {
+            let cw = world.resource::<ChunkWorld>();
+            let mut found_water_inside = false;
+            for wy in 2..=7 {
+                let cp = global_to_chunk(world_cell_to_global_atom(5, wy));
+                if let Some(atom) = cw.get_atom(&cp)
+                    && atom.is_liquid()
+                {
+                    found_water_inside = true;
+                    break;
+                }
+            }
+            assert!(
+                found_water_inside,
+                "fluid (liquid) must be able to enter and pass through actor's footprint"
+            );
+        }
+
+        // Clear object atoms
+        world.run_system(clear_actor_objects_system, ());
     }
 }

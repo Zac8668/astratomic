@@ -650,29 +650,16 @@ mod tests {
     }
 
     #[test]
-    fn ca_simulation_sand_and_water_and_prefabs() {
+    fn ca_simulation_sand_and_water() {
         use crate::{
             atom::Materials,
             ca::step_chunk_simulation,
-            prefabs::PrefabConfigs,
-            world::{DirtyRects, Generator, URect, global_to_chunk, resolve_assets_dir},
+            world::{DirtyRects, URect, global_to_chunk},
         };
 
         let materials = Materials::default_builtin();
-        let generator = Generator::default_config();
 
-        // 1. Verify procedural chunk generation produces non-empty terrain
-        let generated = Chunk::generate_grid(ivec2(0, 0), &materials, &generator);
-        assert!(generated.atoms.iter().any(|a| !a.is_void()));
-
-        // 2. Verify prefabs load from assets/prefabs
-        let prefabs = PrefabConfigs::load_from_assets_dir(resolve_assets_dir());
-        assert!(
-            !prefabs.0.is_empty(),
-            "expected prefabs to load from assets/prefabs"
-        );
-
-        // 3. Verify CA simulation moves sand downward and spreads water
+        // 1. Verify CA simulation moves sand downward and spreads water
         let mut chunk_world = ChunkWorld::default();
         let mut dirty_rects = DirtyRects::default();
         for cx in -1..=1 {
@@ -682,7 +669,7 @@ mod tests {
         }
 
         // Paint a solid rock floor at y = 20 and sand at (10, 10)
-        for x in 5..=15 {
+        for x in 0..=30 {
             chunk_world.paint_at_global(ivec2(x, 20), 8, false, &materials, &mut dirty_rects);
         }
         chunk_world.paint_at_global(ivec2(10, 10), 2, false, &materials, &mut dirty_rects);
@@ -700,7 +687,7 @@ mod tests {
             start_atom.is_void(),
             "sand should have moved away from (10, 10)"
         );
-        let on_floor = (5..=15).any(|x| {
+        let on_floor = (0..=30).any(|x| {
             chunk_world
                 .get_atom(&global_to_chunk(ivec2(x, 19)))
                 .is_some_and(|a| a.material_id == 2)

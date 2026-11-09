@@ -204,29 +204,6 @@ impl Chunk {
         Arc::make_mut(&mut self.grid).atoms.get_mut(index)
     }
 
-    /// Procedurally generate the grid for chunk `index` (see [`crate::worldgen`]).
-    pub fn generate_grid(
-        index: IVec2,
-        materials: &Materials,
-        generator: &Generator,
-    ) -> Arc<ChunkGrid> {
-        generator.generate_grid(index, materials)
-    }
-
-    pub fn new(
-        texture: Handle<Image>,
-        index: IVec2,
-        materials: &Materials,
-        generator: &Generator,
-    ) -> Chunk {
-        Chunk {
-            grid: Self::generate_grid(index, materials, generator),
-            texture,
-            entity: None,
-            auto_save: None,
-        }
-    }
-
     pub fn new_image() -> Image {
         Image::Data(image::DynamicImage::ImageRgba8(image::RgbaImage::new(
             CHUNK_SIZE as u32,

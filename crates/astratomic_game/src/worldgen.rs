@@ -20,9 +20,10 @@ use bones_framework::prelude::*;
 use fastnoise_lite::{DomainWarpType, FastNoiseLite, FractalType, NoiseType};
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use astratomic_sim::{
     atom::{Atom, Materials},
     chunk::{CHUNK_SIZE, ChunkGrid},
+    world::{ChunkGeneratorHook, resolve_assets_dir},
 };
 
 // Material IDs used by the generator (must match `assets/atoms.ron`).
@@ -60,8 +61,10 @@ pub struct Generator {
     pub cave_density: f32,
     /// Depth in atoms over which caves fade in below the surface.
     pub cave_fade_depth: f32,
-    /// Multiplier for ore vein thickness (`0` = no ores, `1` = default).
+    /// Multiplier for ore deposit quantity/richness (`0` = no ores, `1` = default, `3+` = abundant).
     pub ore_richness: f32,
+    /// Multiplier for individual ore blob size (`0.5` = small nuggets, `1` = default, `2+` = giant blobs).
+    pub ore_blob_size: f32,
 }
 
 impl Default for Generator {
@@ -74,13 +77,14 @@ impl Generator {
     pub const fn default_config() -> Self {
         Self {
             seed: 8668,
-            scale: REFERENCE_SCALE,
+            scale: 4096.,
             surface_level: -256,
-            hill_amplitude: 48.0,
-            mountain_amplitude: 70.0,
+            hill_amplitude: 70.0,
+            mountain_amplitude: 100.0,
             cave_density: 1.0,
-            cave_fade_depth: 56.0,
-            ore_richness: 1.0,
+            cave_fade_depth: 128.0,
+            ore_richness: 0.01,
+            ore_blob_size: 0.7,
         }
     }
 
@@ -150,6 +154,40 @@ impl Generator {
 
         Arc::from(grid)
     }
+
+    /// Create a [`ChunkGeneratorHook`] wrapping this generator configuration.
+    pub fn create_hook(&self) -> ChunkGeneratorHook {
+        let copy = *self;
+        ChunkGeneratorHook::new(self.seed, move |pos, mats| copy.generate_grid(pos, mats))
+    }
+}
+
+/// Bones plugin for world generation, registering schemas, loading `gen.ron`, and
+/// installing [`Generator`] and [`ChunkGeneratorHook`] resources into sessions.
+#[derive(Default, Clone, Copy)]
+pub struct AstratomicWorldgenPlugin;
+
+impl GamePlugin for AstratomicWorldgenPlugin {
+    fn install(self, _game: &mut Game) {
+        Generator::register_schema();
+    }
+}
+
+impl SessionPlugin for AstratomicWorldgenPlugin {
+    fn install(self, session: &mut Session) {
+        Generator::register_schema();
+
+        let assets_dir = resolve_assets_dir();
+        let gen_path = assets_dir.join("gen.ron");
+        let generator = std::fs::read(&gen_path)
+            .ok()
+            .and_then(|bytes| Generator::from_ron_bytes(&bytes).ok())
+            .unwrap_or_else(Generator::default_config);
+
+        let hook = generator.create_hook();
+        session.world.insert_resource(generator);
+        session.world.insert_resource(hook);
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -215,6 +253,10 @@ impl WorldNoise {
         let f = (REFERENCE_SCALE / scale) as f32;
         let s = cfg.seed;
 
+        // Scaling frequency inversely with blob size directly stretches/shrinks the geometric radius of blobs in world space
+        let blob_size = cfg.ore_blob_size.clamp(0.2, 5.0);
+        let bf = f / blob_size;
+
         let mut warp = make_noise(s, 6, 0.0045 * f, FractalType::None, 1);
         warp.set_domain_warp_type(Some(DomainWarpType::OpenSimplex2));
         warp.set_domain_warp_amp(Some(38.0 / f));
@@ -231,11 +273,11 @@ impl WorldNoise {
             noodle_width: make_noise(s, 8, 0.008 * f, FractalType::None, 1),
             chamber: make_noise(s, 9, 0.0042 * f, FractalType::FBm, 3),
             pockets: make_noise(s, 10, 0.02 * f, FractalType::FBm, 2),
-            coal_blob: make_noise(s, 11, 0.038 * f, FractalType::FBm, 2),
+            coal_blob: make_noise(s, 11, 0.038 * bf, FractalType::FBm, 2),
             coal_cluster: make_noise(s, 12, 0.009 * f, FractalType::None, 1),
-            iron_blob: make_noise(s, 13, 0.048 * f, FractalType::FBm, 2),
+            iron_blob: make_noise(s, 13, 0.048 * bf, FractalType::FBm, 2),
             iron_cluster: make_noise(s, 14, 0.011 * f, FractalType::None, 1),
-            gold_blob: make_noise(s, 15, 0.060 * f, FractalType::FBm, 2),
+            gold_blob: make_noise(s, 15, 0.060 * bf, FractalType::FBm, 2),
             gold_cluster: make_noise(s, 16, 0.013 * f, FractalType::None, 1),
         }
     }
@@ -244,7 +286,8 @@ impl WorldNoise {
         let hills = self.hills.get_noise_2d(x, 0.0) * cfg.hill_amplitude;
         // Mountains only rise where the very-low-frequency mask is positive.
         let mask = smoothstep(0.05, 0.45, self.mountain_mask.get_noise_2d(x, 0.0));
-        let mountains = (self.mountains.get_noise_2d(x, 0.0) * 0.5 + 0.5) * cfg.mountain_amplitude * mask;
+        let mountains =
+            (self.mountains.get_noise_2d(x, 0.0) * 0.5 + 0.5) * cfg.mountain_amplitude * mask;
         let detail = self.surface_detail.get_noise_2d(x, 0.0) * 2.0;
         let height = hills + mountains + detail;
 
@@ -267,7 +310,11 @@ impl WorldNoise {
         }
 
         // Surface depth-fading: 0 at the surface, 1 once `cave_fade_depth` deep.
-        let fade = smoothstep(0.0, cfg.cave_fade_depth.max(1.0), depth + col.entrance_bonus);
+        let fade = smoothstep(
+            0.0,
+            cfg.cave_fade_depth.max(1.0),
+            depth + col.entrance_bonus,
+        );
         if fade <= 0.0 {
             return false;
         }
@@ -275,17 +322,16 @@ impl WorldNoise {
         let (wx, wy) = self.warp.domain_warp_2d(x, y);
 
         // Noodle tunnels: the zero-isoline of warped noise forms long, connected, winding paths.
-        let width = (0.04 + 0.03 * self.noodle_width.get_noise_2d(x, y)).max(0.0)
-            * fade
-            * cfg.cave_density;
+        let width =
+            (0.04 + 0.03 * self.noodle_width.get_noise_2d(x, y)).max(0.0) * fade * cfg.cave_density;
         if self.noodle.get_noise_2d(wx, wy).abs() < width {
             return true;
         }
 
         // Large chambers: high plateaus of low-frequency noise, more common with depth.
         let depth01 = (depth / 900.0).clamp(0.0, 1.0);
-        let threshold = lerp(0.6, 0.4, depth01) + (1.0 - fade) * 0.5
-            + (1.0 - cfg.cave_density.min(2.0)) * 0.25;
+        let threshold =
+            lerp(0.6, 0.4, depth01) + (1.0 - fade) * 0.5 + (1.0 - cfg.cave_density.min(2.0)) * 0.25;
         self.chamber.get_noise_2d(wx * 0.9, wy * 1.25) > threshold
     }
 
@@ -327,11 +373,18 @@ impl WorldNoise {
 
         if cfg.ore_richness > 0.0 {
             // Ore blobs: 2D smooth noise peaks modulated by cluster noise form isolated, rounded deposits.
-            let richness_offset = (cfg.ore_richness - 1.0) * 0.05;
+            let richness = cfg.ore_richness.clamp(0.0, 10.0);
+            let blob_size = cfg.ore_blob_size.clamp(0.2, 5.0);
+
+            // Richness lowers the required cluster strength so deposits spawn much more frequently
+            let cluster_req_offset = (richness - 1.0) * 0.28;
+            // Both richness and blob size expand the threshold so blobs are fatter and fuller
+            let threshold_expansion = (richness - 1.0) * 0.08 + (blob_size - 1.0) * 0.07;
 
             let is_in_blob = |blob_noise: &FastNoiseLite,
                               cluster_noise: &FastNoiseLite,
                               min_depth: f32,
+                              base_cluster_min: f32,
                               base_threshold: f32,
                               rng: &mut fastrand::Rng|
              -> bool {
@@ -339,9 +392,17 @@ impl WorldNoise {
                     return false;
                 }
                 let cluster = cluster_noise.get_noise_2d(x, y);
+                let required_cluster = base_cluster_min - cluster_req_offset;
+                let cluster_diff = cluster - required_cluster;
+                // Early exit if outside the cluster hotspot
+                if cluster_diff < -0.12 {
+                    return false;
+                }
+
                 let depth_boost = smoothstep(min_depth, min_depth + 90.0, depth) * 0.04;
                 // Cluster centers lower the threshold, letting the 2D noise peak expand into a blob
-                let threshold = base_threshold - (cluster * 0.22) - depth_boost - richness_offset;
+                let threshold =
+                    base_threshold - (cluster_diff * 0.32) - depth_boost - threshold_expansion;
 
                 let shape = blob_noise.get_noise_2d(x, y);
                 let margin = shape - threshold;
@@ -355,13 +416,13 @@ impl WorldNoise {
             };
 
             // Check rarest to most common
-            if is_in_blob(&self.gold_blob, &self.gold_cluster, 240.0, 0.67, rng) {
+            if is_in_blob(&self.gold_blob, &self.gold_cluster, 240.0, 0.35, 0.65, rng) {
                 return MAT_GOLD;
             }
-            if is_in_blob(&self.iron_blob, &self.iron_cluster, 80.0, 0.60, rng) {
+            if is_in_blob(&self.iron_blob, &self.iron_cluster, 80.0, 0.20, 0.58, rng) {
                 return MAT_IRON;
             }
-            if is_in_blob(&self.coal_blob, &self.coal_cluster, 24.0, 0.55, rng) {
+            if is_in_blob(&self.coal_blob, &self.coal_cluster, 24.0, 0.05, 0.52, rng) {
                 return MAT_COAL;
             }
         }
@@ -440,7 +501,8 @@ mod tests {
                     for x in 0..CHUNK_SIZE {
                         let idx = y * CHUNK_SIZE + x;
                         let mat = grid.atoms[idx].material_id;
-                        if (mat == MAT_COAL || mat == MAT_IRON || mat == MAT_GOLD) && !visited[idx] {
+                        if (mat == MAT_COAL || mat == MAT_IRON || mat == MAT_GOLD) && !visited[idx]
+                        {
                             // Flood-fill connected ore component
                             let mut queue = vec![(x, y)];
                             visited[idx] = true;
@@ -460,7 +522,11 @@ mod tests {
                                 for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
                                     let nx = qx as i32 + dx;
                                     let ny = qy as i32 + dy;
-                                    if nx >= 0 && nx < CHUNK_SIZE as i32 && ny >= 0 && ny < CHUNK_SIZE as i32 {
+                                    if nx >= 0
+                                        && nx < CHUNK_SIZE as i32
+                                        && ny >= 0
+                                        && ny < CHUNK_SIZE as i32
+                                    {
                                         let nidx = ny as usize * CHUNK_SIZE + nx as usize;
                                         if !visited[nidx] && grid.atoms[nidx].material_id == mat {
                                             visited[nidx] = true;
@@ -482,6 +548,139 @@ mod tests {
                 }
             }
         }
-        assert!(found_blob, "expected to find ore blobs with 2D width and height >= 3");
+        assert!(
+            found_blob,
+            "expected to find ore blobs with 2D width and height >= 3"
+        );
+    }
+
+    #[test]
+    fn ore_richness_and_blob_size_control_quantity_and_size() {
+        let materials = Materials::default_builtin();
+
+        // 1. Zero richness -> 0 ore atoms
+        let zero_gen = Generator {
+            ore_richness: 0.0,
+            ..Generator::default_config()
+        };
+        let mut zero_ore_count = 0;
+        for cy in 1..4 {
+            for cx in -1..2 {
+                let grid = zero_gen.generate_grid(ivec2(cx, cy), &materials);
+                zero_ore_count += grid
+                    .atoms
+                    .iter()
+                    .filter(|a| {
+                        a.material_id == MAT_COAL
+                            || a.material_id == MAT_IRON
+                            || a.material_id == MAT_GOLD
+                    })
+                    .count();
+            }
+        }
+        assert_eq!(
+            zero_ore_count, 0,
+            "ore_richness = 0 should produce zero ore atoms"
+        );
+
+        // 2. High richness vs Low richness
+        let low_gen = Generator {
+            ore_richness: 0.4,
+            ..Generator::default_config()
+        };
+        let high_gen = Generator {
+            ore_richness: 2.5,
+            ..Generator::default_config()
+        };
+        let mut low_ore_count = 0;
+        let mut high_ore_count = 0;
+        for cy in 1..5 {
+            for cx in -2..3 {
+                let g_low = low_gen.generate_grid(ivec2(cx, cy), &materials);
+                let g_high = high_gen.generate_grid(ivec2(cx, cy), &materials);
+                low_ore_count += g_low
+                    .atoms
+                    .iter()
+                    .filter(|a| {
+                        a.material_id == MAT_COAL
+                            || a.material_id == MAT_IRON
+                            || a.material_id == MAT_GOLD
+                    })
+                    .count();
+                high_ore_count += g_high
+                    .atoms
+                    .iter()
+                    .filter(|a| {
+                        a.material_id == MAT_COAL
+                            || a.material_id == MAT_IRON
+                            || a.material_id == MAT_GOLD
+                    })
+                    .count();
+            }
+        }
+        assert!(
+            high_ore_count > low_ore_count * 2,
+            "high richness ({high_ore_count}) must produce significantly more ore than low richness ({low_ore_count})"
+        );
+
+        // 3. Blob size scaling: large blob size vs small blob size
+        let small_blob_gen = Generator {
+            ore_blob_size: 0.5,
+            ..Generator::default_config()
+        };
+        let large_blob_gen = Generator {
+            ore_blob_size: 2.5,
+            ..Generator::default_config()
+        };
+        let count_max_blob = |generator: &Generator| -> usize {
+            let mut max_blob = 0;
+            for cy in 1..4 {
+                for cx in -1..2 {
+                    let grid = generator.generate_grid(ivec2(cx, cy), &materials);
+                    let mut visited = [false; CHUNK_SIZE * CHUNK_SIZE];
+                    for y in 0..CHUNK_SIZE {
+                        for x in 0..CHUNK_SIZE {
+                            let idx = y * CHUNK_SIZE + x;
+                            let mat = grid.atoms[idx].material_id;
+                            if (mat == MAT_COAL || mat == MAT_IRON || mat == MAT_GOLD)
+                                && !visited[idx]
+                            {
+                                let mut count = 0;
+                                let mut q = vec![(x, y)];
+                                visited[idx] = true;
+                                while let Some((qx, qy)) = q.pop() {
+                                    count += 1;
+                                    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                                        let nx = qx as i32 + dx;
+                                        let ny = qy as i32 + dy;
+                                        if nx >= 0
+                                            && nx < CHUNK_SIZE as i32
+                                            && ny >= 0
+                                            && ny < CHUNK_SIZE as i32
+                                        {
+                                            let nidx = ny as usize * CHUNK_SIZE + nx as usize;
+                                            if !visited[nidx] && grid.atoms[nidx].material_id == mat
+                                            {
+                                                visited[nidx] = true;
+                                                q.push((nx as usize, ny as usize));
+                                            }
+                                        }
+                                    }
+                                }
+                                max_blob = max_blob.max(count);
+                            }
+                        }
+                    }
+                }
+            }
+            max_blob
+        };
+
+        let small_max = count_max_blob(&small_blob_gen);
+        let large_max = count_max_blob(&large_blob_gen);
+        assert!(
+            large_max > small_max,
+            "large blob size ({large_max}) must produce larger blobs than small blob size ({small_max})"
+        );
     }
 }

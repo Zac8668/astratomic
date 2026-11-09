@@ -25,11 +25,15 @@ glam.workspace = true
 serde.workspace = true
 ron.workspace = true
 thiserror.workspace = true
+tracing = "0.1"
 
-fastnoise-lite = "1.1"
 contour = "0.13"
 geo = "0.29"
 image = { version = "0.24", default-features = false, features = ["png"] }
 itertools = "0.15"
 puffin = "0.19"
 fastrand = "2.5"
+
+[dev-dependencies]
+bevy_tasks = "0.11"
+

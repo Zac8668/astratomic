@@ -63,6 +63,11 @@ impl AtomState {
             _ => Self::Solid,
         }
     }
+
+    #[inline]
+    pub const fn is_fluid(&self) -> bool {
+        matches!(self, Self::Liquid | Self::Gas)
+    }
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone, Copy, HasSchema)]
@@ -78,7 +83,25 @@ pub struct Material {
     pub default_state: AtomState,
 }
 
+/// Custom [`bones_asset::AssetLoader`] for loading [`Materials`] from `.ron` / `atoms.ron` asset files.
+pub struct MaterialsAssetLoader;
+
+impl bones_asset::AssetLoader for MaterialsAssetLoader {
+    fn load(
+        &self,
+        _ctx: bones_asset::AssetLoadCtx,
+        bytes: &[u8],
+    ) -> bones_asset::BoxedFuture<bones_asset::anyhow::Result<bones_asset::SchemaBox>> {
+        let bytes = bytes.to_vec();
+        Box::pin(async move {
+            let materials = Materials::from_ron_bytes(&bytes)?;
+            Ok(bones_asset::SchemaBox::new(materials))
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone, HasSchema)]
+#[type_data(bones_asset::asset_loader(["atoms.ron", "ron"], MaterialsAssetLoader))]
 pub struct Materials(pub Vec<Material>);
 
 impl Materials {
@@ -125,7 +148,7 @@ impl Materials {
             },
             // 4: Gravel
             Material {
-                inertial_resistance: 0.92,
+                inertial_resistance: 0.60,
                 default_state: AtomState::Powder,
                 ..Default::default()
             },
@@ -211,8 +234,10 @@ impl std::ops::Index<u8> for Materials {
 impl Atom {
     /// Low 3 bits of `flags` encode [`AtomState`].
     pub const STATE_MASK: u8 = 0b0000_0111;
-    /// Bit 3 of `flags` indicates whether a powder/liquid atom is actively moving.
-    pub const FLAG_MOVING: u8 = 0b0000_1000;
+    /// Bit 3 of `flags` indicates whether a powder atom is actively free-falling.
+    pub const FLAG_FREE_FALLING: u8 = 0b0000_1000;
+    /// Alias for backwards compatibility with liquid/powder movement checks.
+    pub const FLAG_MOVING: u8 = Self::FLAG_FREE_FALLING;
     /// Bits 4..6 of `flags` store `f_idle` (0..=3).
     pub const F_IDLE_SHIFT: u8 = 4;
     pub const F_IDLE_MASK: u8 = 0b0011_0000;
@@ -241,10 +266,15 @@ impl Atom {
 
     #[inline]
     pub const fn with_state(material_id: u8, state: AtomState, color: [u8; 4]) -> Self {
+        let flags = if (state as u8) == (AtomState::Powder as u8) {
+            (state as u8) | Self::FLAG_FREE_FALLING
+        } else {
+            state as u8
+        };
         Self {
             color,
             material_id,
-            flags: state as u8,
+            flags,
             vx: 0,
             vy: 0,
         }
@@ -377,7 +407,8 @@ impl Atom {
         Self::with_state(id, state, color)
     }
 
-    pub const PAINTABLE_MATERIAL_IDS: [u8; 15] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    pub const PAINTABLE_MATERIAL_IDS: [u8; 15] =
+        [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
     #[inline]
     pub const fn material_name(id: u8) -> &'static str {
@@ -442,21 +473,41 @@ impl Atom {
 
     #[inline]
     pub fn set_state(&mut self, state: AtomState) {
-        self.flags = (self.flags & !Self::STATE_MASK) | (state as u8);
+        let base_flags = (self.flags & !Self::STATE_MASK) | (state as u8);
+        self.flags = if matches!(state, AtomState::Powder) {
+            base_flags | Self::FLAG_FREE_FALLING
+        } else {
+            base_flags
+        };
+    }
+
+    #[inline]
+    pub const fn is_free_falling(&self) -> bool {
+        (self.flags & Self::FLAG_FREE_FALLING) != 0
+    }
+
+    #[inline]
+    pub const fn free_falling(&self) -> bool {
+        self.is_free_falling()
+    }
+
+    #[inline]
+    pub fn set_free_falling(&mut self, free_falling: bool) {
+        if free_falling {
+            self.flags |= Self::FLAG_FREE_FALLING;
+        } else {
+            self.flags &= !Self::FLAG_FREE_FALLING;
+        }
     }
 
     #[inline]
     pub const fn moving(&self) -> bool {
-        (self.flags & Self::FLAG_MOVING) != 0
+        self.is_free_falling()
     }
 
     #[inline]
     pub fn set_moving(&mut self, moving: bool) {
-        if moving {
-            self.flags |= Self::FLAG_MOVING;
-        } else {
-            self.flags &= !Self::FLAG_MOVING;
-        }
+        self.set_free_falling(moving);
     }
 
     #[inline]
@@ -509,5 +560,10 @@ impl Atom {
     #[inline]
     pub const fn is_gas(&self) -> bool {
         matches!(self.state(), AtomState::Gas)
+    }
+
+    #[inline]
+    pub const fn is_fluid(&self) -> bool {
+        self.state().is_fluid()
     }
 }
