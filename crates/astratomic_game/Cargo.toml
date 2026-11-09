@@ -16,7 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 astratomic_sim.workspace = true
-astratomic_physics.workspace = true
 astratomic_render.workspace = true
 
 bones_framework.workspace = true
@@ -26,6 +25,7 @@ bones_asset.workspace = true
 bones_schema.workspace = true
 bones_wgpu_renderer.workspace = true
 
+fastrand = "2.5"
 glam.workspace = true
 serde.workspace = true
 ron.workspace = true

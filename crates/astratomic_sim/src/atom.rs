@@ -1,5 +1,4 @@
 use bones_schema::HasSchema;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 /// Compact 8-byte `Pod` atom representation storing a baked RGBA8 color and a `u8` material ID.
@@ -98,6 +97,84 @@ impl Materials {
     pub fn get_from_id(&self, id: u8) -> &Material {
         &self.0[id as usize]
     }
+
+    pub fn default_builtin() -> Self {
+        Self(vec![
+            // 0: Void
+            Material {
+                default_state: AtomState::Void,
+                ..Default::default()
+            },
+            // 1: Object
+            Material {
+                default_state: AtomState::Object,
+                ..Default::default()
+            },
+            // 2: Sand
+            Material {
+                inertial_resistance: 0.1,
+                default_state: AtomState::Powder,
+                ..Default::default()
+            },
+            // 3: Water
+            Material {
+                flow: 5,
+                damage: 0.0,
+                default_state: AtomState::Liquid,
+                ..Default::default()
+            },
+            // 4: Gravel
+            Material {
+                inertial_resistance: 0.92,
+                default_state: AtomState::Powder,
+                ..Default::default()
+            },
+            // 5: Lava
+            Material {
+                flow: 1,
+                damage: 15.0,
+                default_state: AtomState::Liquid,
+                ..Default::default()
+            },
+            // 6: Grass
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
+            // 7: Dirt
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
+            // 8: Rock
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
+            // 9: Acid
+            Material {
+                flow: 5,
+                damage: 3.0,
+                default_state: AtomState::Liquid,
+                ..Default::default()
+            },
+            // 10: Compacted Dirt
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
+            // 11: Leaves
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
+            // 12: Wood
+            Material {
+                default_state: AtomState::Solid,
+                ..Default::default()
+            },
+        ])
+    }
 }
 
 impl std::ops::Index<&Atom> for Materials {
@@ -159,96 +236,143 @@ impl Atom {
     }
 
     pub fn new(id: u8, materials: &Materials) -> Self {
+        if id == 0 {
+            return Self::VOID;
+        }
+        if id == 1 {
+            return Self::object();
+        }
+
         let state = materials
             .0
             .get(id as usize)
             .map(|m| m.default_state)
             .unwrap_or_else(|| AtomState::default_for_material_id(id));
 
-        let mut rng = rand::rng();
         let color = match id {
-            0 | 1 => [0, 0, 0, 0],
             2 => [
                 // Sand
-                (230 + rng.random_range(-20_i16..20_i16)) as u8,
-                (197 + rng.random_range(-20_i16..20_i16)) as u8,
-                (92 + rng.random_range(-20_i16..20_i16)) as u8,
+                (230 + fastrand::i16(-20..20)) as u8,
+                (197 + fastrand::i16(-20..20)) as u8,
+                (92 + fastrand::i16(-20..20)) as u8,
                 255,
             ],
             3 => [
                 // Water
-                (20 + rng.random_range(-20_i16..20_i16)) as u8,
-                (125 + rng.random_range(-20_i16..20_i16)) as u8,
-                (204 + rng.random_range(-20_i16..20_i16)) as u8,
+                (20 + fastrand::i16(-20..20)) as u8,
+                (125 + fastrand::i16(-20..20)) as u8,
+                (204 + fastrand::i16(-20..20)) as u8,
                 150,
             ],
             4 => [
                 // Gravel
-                (110 + rng.random_range(-12_i16..12_i16)) as u8,
-                (110 + rng.random_range(-12_i16..12_i16)) as u8,
-                (110 + rng.random_range(-12_i16..12_i16)) as u8,
+                (110 + fastrand::i16(-12..12)) as u8,
+                (110 + fastrand::i16(-12..12)) as u8,
+                (110 + fastrand::i16(-12..12)) as u8,
                 255,
             ],
             5 => [
                 // Lava
-                (245 + rng.random_range(-10_i16..10_i16)) as u8,
-                (140 + rng.random_range(-20_i16..20_i16)) as u8,
-                (10 + rng.random_range(-10_i16..10_i16)) as u8,
+                (245 + fastrand::i16(-10..10)) as u8,
+                (140 + fastrand::i16(-20..20)) as u8,
+                (10 + fastrand::i16(-10..10)) as u8,
                 255,
             ],
             6 => [
                 // Grass
-                (40 + rng.random_range(-10_i16..10_i16)) as u8,
-                (165 + rng.random_range(-10_i16..10_i16)) as u8,
-                (49 + rng.random_range(-5_i16..5_i16)) as u8,
+                (40 + fastrand::i16(-10..10)) as u8,
+                (165 + fastrand::i16(-10..10)) as u8,
+                (49 + fastrand::i16(-5..5)) as u8,
                 255,
             ],
             7 => [
                 // Dirt
-                (120 + rng.random_range(-10_i16..10_i16)) as u8,
-                (70 + rng.random_range(-10_i16..10_i16)) as u8,
-                (40 + rng.random_range(-5_i16..5_i16)) as u8,
+                (120 + fastrand::i16(-10..10)) as u8,
+                (70 + fastrand::i16(-10..10)) as u8,
+                (40 + fastrand::i16(-5..5)) as u8,
                 255,
             ],
             8 => [
                 // Rock
-                (80 + rng.random_range(-10_i16..10_i16)) as u8,
-                (80 + rng.random_range(-10_i16..10_i16)) as u8,
-                (80 + rng.random_range(-5_i16..5_i16)) as u8,
+                (80 + fastrand::i16(-10..10)) as u8,
+                (80 + fastrand::i16(-10..10)) as u8,
+                (80 + fastrand::i16(-5..5)) as u8,
                 255,
             ],
             9 => [
                 // Acid
-                (10 + rng.random_range(-10_i16..10_i16)) as u8,
-                (230 + rng.random_range(-10_i16..10_i16)) as u8,
-                (40 + rng.random_range(-5_i16..5_i16)) as u8,
+                (10 + fastrand::i16(-10..10)) as u8,
+                (230 + fastrand::i16(-10..10)) as u8,
+                (40 + fastrand::i16(-5..5)) as u8,
                 255,
             ],
             10 => [
                 // Compacted Dirt
-                (100 + rng.random_range(-10_i16..10_i16)) as u8,
-                (50 + rng.random_range(-10_i16..10_i16)) as u8,
-                (30 + rng.random_range(-5_i16..5_i16)) as u8,
+                (100 + fastrand::i16(-10..10)) as u8,
+                (50 + fastrand::i16(-10..10)) as u8,
+                (30 + fastrand::i16(-5..5)) as u8,
                 255,
             ],
             11 => [
                 // Leaves
-                (60 + rng.random_range(-15_i16..15_i16)) as u8,
-                (180 + rng.random_range(-20_i16..20_i16)) as u8,
-                (60 + rng.random_range(-10_i16..10_i16)) as u8,
+                (60 + fastrand::i16(-15..15)) as u8,
+                (180 + fastrand::i16(-20..20)) as u8,
+                (60 + fastrand::i16(-10..10)) as u8,
                 220,
             ],
             12 => [
                 // Wood
-                (120 + rng.random_range(-10_i16..10_i16)) as u8,
-                (80 + rng.random_range(-10_i16..10_i16)) as u8,
-                (40 + rng.random_range(-5_i16..5_i16)) as u8,
+                (120 + fastrand::i16(-10..10)) as u8,
+                (80 + fastrand::i16(-10..10)) as u8,
+                (40 + fastrand::i16(-5..5)) as u8,
                 255,
             ],
             _ => panic!("Atom not found, invalid ID. {id}"),
         };
 
         Self::with_state(id, state, color)
+    }
+
+    pub const PAINTABLE_MATERIAL_IDS: [u8; 12] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+    #[inline]
+    pub const fn material_name(id: u8) -> &'static str {
+        match id {
+            0 => "Void (Erase)",
+            1 => "Object",
+            2 => "Sand",
+            3 => "Water",
+            4 => "Gravel",
+            5 => "Lava",
+            6 => "Grass",
+            7 => "Dirt",
+            8 => "Rock",
+            9 => "Acid",
+            10 => "Compacted Dirt",
+            11 => "Leaves",
+            12 => "Wood",
+            _ => "Unknown",
+        }
+    }
+
+    #[inline]
+    pub const fn material_preview_color(id: u8) -> [u8; 4] {
+        match id {
+            0 => [30, 32, 42, 255],
+            1 => [255, 255, 255, 255],
+            2 => [230, 197, 92, 255],
+            3 => [20, 125, 204, 200],
+            4 => [110, 110, 110, 255],
+            5 => [245, 140, 10, 255],
+            6 => [40, 165, 49, 255],
+            7 => [120, 70, 40, 255],
+            8 => [80, 80, 80, 255],
+            9 => [10, 230, 40, 255],
+            10 => [100, 50, 30, 255],
+            11 => [60, 180, 60, 220],
+            12 => [120, 80, 40, 255],
+            _ => [255, 0, 255, 255],
+        }
     }
 
     #[inline]

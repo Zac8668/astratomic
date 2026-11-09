@@ -26,13 +26,10 @@ serde.workspace = true
 ron.workspace = true
 thiserror.workspace = true
 
-serde_derive = "1.0"
 noise = "0.9.0"
 contour = "0.13"
 geo = "0.29"
 image = { version = "0.24", default-features = false, features = ["png"] }
-async-channel = "2.1"
-itertools = "0.14"
+itertools = "0.15"
 puffin = "0.19"
-rand = "0.9"
-futures-lite = "2.3"
+fastrand = "2.5"

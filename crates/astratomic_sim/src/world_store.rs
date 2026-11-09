@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::chunk::ChunkGrid;
 
-pub const WORLD_DB_PATH: &str = "assets/world/world.redb";
+pub const WORLD_DB_PATH: &str = "saves/world.redb";
 
 pub const CHUNKS_TABLE: TableDefinition<(i32, i32), &[u8]> = TableDefinition::new("chunks");
 pub const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("world_meta");
@@ -194,12 +194,104 @@ impl WorldStorage {
 pub enum IoRequest {
     SaveBatch(Vec<((i32, i32), Arc<ChunkGrid>)>),
     LoadChunk(i32, i32),
+    Flush(Sender<()>),
+    Shutdown,
 }
 
 /// Responses sent from the background storage I/O worker thread back to the simulation thread.
 #[derive(Clone, Debug)]
 pub enum IoResponse {
     ChunkLoaded((i32, i32), Option<Arc<ChunkGrid>>),
+}
+
+/// Shared handle allowing individual [`Chunk`][crate::chunk::Chunk]s and
+/// [`ChunkWorld`][crate::world::ChunkWorld] to automatically persist chunk grids when unloaded,
+/// dropped, or when the game closes.
+#[derive(Clone)]
+pub struct WorldSaveHandle {
+    request_tx: Sender<IoRequest>,
+    storage: WorldStorage,
+}
+
+impl std::fmt::Debug for WorldSaveHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorldSaveHandle").finish_non_exhaustive()
+    }
+}
+
+impl WorldSaveHandle {
+    pub fn new(request_tx: Sender<IoRequest>, storage: WorldStorage) -> Self {
+        Self {
+            request_tx,
+            storage,
+        }
+    }
+
+    pub fn storage(&self) -> &WorldStorage {
+        &self.storage
+    }
+
+    /// Enqueue a single chunk to be saved on the background I/O worker, falling back to a direct
+    /// synchronous write if the worker thread has already shut down.
+    pub fn save_chunk(&self, coords: (i32, i32), grid: Arc<ChunkGrid>) {
+        let batch = vec![(coords, grid)];
+        if let Err(crossbeam_channel::SendError(IoRequest::SaveBatch(batch))) =
+            self.request_tx.send(IoRequest::SaveBatch(batch))
+        {
+            let _ = self.storage.save_chunks_batch(&batch);
+        }
+    }
+
+    /// Enqueue a batch of chunks to be saved on the background I/O worker, falling back to a
+    /// direct synchronous write if the worker thread has already shut down.
+    pub fn save_batch(&self, mut batch: Vec<((i32, i32), Arc<ChunkGrid>)>) {
+        if batch.is_empty() {
+            return;
+        }
+        batch.sort_by_key(|(coords, _)| *coords);
+        if let Err(crossbeam_channel::SendError(IoRequest::SaveBatch(batch))) =
+            self.request_tx.send(IoRequest::SaveBatch(batch))
+        {
+            let _ = self.storage.save_chunks_batch(&batch);
+        }
+    }
+
+    /// Synchronously flush any queued saves on the background worker, or write `batch` directly
+    /// to [`WorldStorage`] if the worker has already stopped.
+    pub fn save_batch_and_flush(&self, mut batch: Vec<((i32, i32), Arc<ChunkGrid>)>) {
+        if batch.is_empty() {
+            return;
+        }
+        batch.sort_by_key(|(coords, _)| *coords);
+        match self.request_tx.send(IoRequest::SaveBatch(batch)) {
+            Ok(()) => {
+                let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+                if self.request_tx.send(IoRequest::Flush(ack_tx)).is_ok() {
+                    let _ = ack_rx.recv();
+                }
+            }
+            Err(crossbeam_channel::SendError(IoRequest::SaveBatch(batch))) => {
+                let _ = self.storage.save_chunks_batch(&batch);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+struct WorkerThreadGuard {
+    request_tx: Sender<IoRequest>,
+    join_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for WorkerThreadGuard {
+    fn drop(&mut self) {
+        let _ = self.request_tx.send(IoRequest::Shutdown);
+        if let Ok(mut guard) = self.join_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Non-blocking background I/O worker resource for `bones_ecs`.
@@ -214,6 +306,9 @@ pub struct WorldIoWorker {
     pub deterministic_queue: VecDeque<IoResponse>,
     /// Coordinates of chunks currently requested for loading to prevent duplicate in-flight loads.
     pub pending_loads: HashSet<(i32, i32)>,
+    save_handle: Option<WorldSaveHandle>,
+    #[allow(dead_code)]
+    worker_guard: Option<Arc<WorkerThreadGuard>>,
 }
 
 impl Default for WorldIoWorker {
@@ -225,6 +320,8 @@ impl Default for WorldIoWorker {
             response_rx,
             deterministic_queue: VecDeque::new(),
             pending_loads: HashSet::new(),
+            save_handle: None,
+            worker_guard: None,
         }
     }
 }
@@ -234,19 +331,41 @@ impl WorldIoWorker {
     pub fn spawn(storage: WorldStorage) -> Self {
         let (request_tx, request_rx) = crossbeam_channel::unbounded::<IoRequest>();
         let (response_tx, response_rx) = crossbeam_channel::unbounded::<IoResponse>();
+        let save_handle = WorldSaveHandle::new(request_tx.clone(), storage.clone());
 
-        std::thread::Builder::new()
+        let join_handle = std::thread::Builder::new()
             .name("astratomic-world-io".to_string())
             .spawn(move || {
                 Self::worker_loop(storage, request_rx, response_tx);
             })
             .expect("failed to spawn background world I/O worker thread");
 
+        let worker_guard = Arc::new(WorkerThreadGuard {
+            request_tx: request_tx.clone(),
+            join_handle: std::sync::Mutex::new(Some(join_handle)),
+        });
+
         Self {
             request_tx,
             response_rx,
             deterministic_queue: VecDeque::new(),
             pending_loads: HashSet::new(),
+            save_handle: Some(save_handle),
+            worker_guard: Some(worker_guard),
+        }
+    }
+
+    /// Return a clonable [`WorldSaveHandle`] that chunks and [`ChunkWorld`][crate::world::ChunkWorld]
+    /// can use to persist themselves on unload or drop.
+    pub fn save_handle(&self) -> Option<WorldSaveHandle> {
+        self.save_handle.clone()
+    }
+
+    /// Wait until all previously queued `SaveBatch` requests have been committed by the worker.
+    pub fn flush(&self) {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        if self.request_tx.send(IoRequest::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
         }
     }
 
@@ -273,12 +392,25 @@ impl WorldIoWorker {
                 }
                 IoRequest::LoadChunk(cx, cy) => {
                     let loaded = storage.load_chunk(cx, cy);
-                    if response_tx
-                        .send(IoResponse::ChunkLoaded((cx, cy), loaded))
-                        .is_err()
-                    {
-                        break;
+                    let _ = response_tx.send(IoResponse::ChunkLoaded((cx, cy), loaded));
+                }
+                IoRequest::Flush(ack_tx) => {
+                    let _ = ack_tx.send(());
+                }
+                IoRequest::Shutdown => {
+                    // Drain any remaining SaveBatch or Flush requests queued before Shutdown.
+                    while let Ok(rem) = request_rx.try_recv() {
+                        match rem {
+                            IoRequest::SaveBatch(batch) => {
+                                let _ = storage.save_chunks_batch(&batch);
+                            }
+                            IoRequest::Flush(ack_tx) => {
+                                let _ = ack_tx.send(());
+                            }
+                            IoRequest::LoadChunk(_, _) | IoRequest::Shutdown => {}
+                        }
                     }
+                    break;
                 }
             }
         }
@@ -350,7 +482,7 @@ mod tests {
             "astratomic_test_{}_{}_{}.redb",
             name,
             std::process::id(),
-            rand::random::<u64>()
+            fastrand::u64(..)
         ));
         path
     }
@@ -513,6 +645,107 @@ mod tests {
         let cw = session.world.resource::<ChunkWorld>();
         let loaded_chunk = cw.get_chunk(ivec2(3, 4)).unwrap();
         assert_eq!(*loaded_chunk.grid, *grid_arc);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn ca_simulation_sand_and_water_and_prefabs() {
+        use crate::{
+            atom::Materials,
+            ca::step_chunk_simulation,
+            prefabs::PrefabConfigs,
+            world::{DirtyRects, Generator, URect, global_to_chunk, resolve_assets_dir},
+        };
+
+        let materials = Materials::default_builtin();
+        let generator = Generator::default_config();
+
+        // 1. Verify procedural chunk generation produces non-empty terrain
+        let generated = Chunk::generate_grid(ivec2(0, 0), &materials, &generator);
+        assert!(generated.atoms.iter().any(|a| !a.is_void()));
+
+        // 2. Verify prefabs load from assets/prefabs
+        let prefabs = PrefabConfigs::load_from_assets_dir(resolve_assets_dir());
+        assert!(
+            !prefabs.0.is_empty(),
+            "expected prefabs to load from assets/prefabs"
+        );
+
+        // 3. Verify CA simulation moves sand downward and spreads water
+        let mut chunk_world = ChunkWorld::default();
+        let mut dirty_rects = DirtyRects::default();
+        for cx in -1..=1 {
+            for cy in -1..=1 {
+                chunk_world.add_chunk(ivec2(cx, cy), Chunk::default());
+            }
+        }
+
+        // Paint a solid rock floor at y = 20 and sand at (10, 10)
+        for x in 5..=15 {
+            chunk_world.paint_at_global(ivec2(x, 20), 8, false, &materials, &mut dirty_rects);
+        }
+        chunk_world.paint_at_global(ivec2(10, 10), 2, false, &materials, &mut dirty_rects);
+        dirty_rects.current.insert(ivec2(0, 0), URect::full_chunk());
+
+        for _ in 0..15 {
+            step_chunk_simulation(&mut chunk_world, &mut dirty_rects, &materials);
+        }
+
+        // The sand atom at (10, 10) should have fallen down onto the rock floor at y = 19
+        let start_atom = chunk_world
+            .get_atom(&global_to_chunk(ivec2(10, 10)))
+            .unwrap();
+        assert!(
+            start_atom.is_void(),
+            "sand should have moved away from (10, 10)"
+        );
+        let on_floor = (5..=15).any(|x| {
+            chunk_world
+                .get_atom(&global_to_chunk(ivec2(x, 19)))
+                .is_some_and(|a| a.material_id == 2)
+        });
+        assert!(
+            on_floor,
+            "sand should rest on top of the rock floor at y = 19"
+        );
+    }
+
+    #[test]
+    fn chunks_save_on_drop_and_world_close() {
+        let db_path = temp_db_path("auto_save_on_drop");
+        let storage = WorldStorage::open(&db_path).expect("failed to open redb");
+
+        {
+            let worker = WorldIoWorker::spawn(storage.clone());
+            let mut chunk_world = ChunkWorld::default();
+            chunk_world.attach_save_handle(worker.save_handle().unwrap());
+
+            // 1. Add chunk (1, 1) and remove + drop it directly; `Chunk::drop` should save it.
+            let mut dropped_chunk = Chunk::default();
+            dropped_chunk.atoms_mut()[0] =
+                Atom::with_state(2, AtomState::Powder, [230, 197, 92, 255]);
+            chunk_world.add_chunk(ivec2(1, 1), dropped_chunk);
+            let removed = chunk_world.remove_chunk(ivec2(1, 1)).unwrap();
+            drop(removed);
+
+            // 2. Leave chunk (2, 2) inside `ChunkWorld` when `ChunkWorld` and `WorldIoWorker`
+            // are dropped (simulating closing the game).
+            let mut active_chunk = Chunk::default();
+            active_chunk.atoms_mut()[5] =
+                Atom::with_state(3, AtomState::Liquid, [43, 128, 212, 224]);
+            chunk_world.add_chunk(ivec2(2, 2), active_chunk);
+        }
+
+        let loaded_1 = storage
+            .load_chunk(1, 1)
+            .expect("dropped chunk (1, 1) should be saved automatically");
+        assert_eq!(loaded_1.atoms[0].material_id, 2);
+
+        let loaded_2 = storage
+            .load_chunk(2, 2)
+            .expect("active chunk (2, 2) should be saved when ChunkWorld drops on close");
+        assert_eq!(loaded_2.atoms[5].material_id, 3);
 
         let _ = std::fs::remove_file(&db_path);
     }

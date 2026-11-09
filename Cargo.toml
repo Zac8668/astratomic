@@ -24,12 +24,8 @@ bones_asset = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
 bones_schema = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
 bones_wgpu_renderer = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
 
-# Rendering & windowing
-wgpu = "24"
-winit = "0.30"
-
 # Physics & geometry
-rapier2d = { version = "0.22", features = ["parallel", "enhanced-determinism"] }
+rapier2d = { version = "0.36", features = ["parallel", "enhanced-determinism"] }
 
 # Storage, compression, & concurrency
 redb = "4.5"

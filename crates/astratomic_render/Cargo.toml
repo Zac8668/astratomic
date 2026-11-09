@@ -10,7 +10,6 @@ authors.workspace = true
 
 [dependencies]
 astratomic_sim.workspace = true
-astratomic_physics.workspace = true
 
 bones_framework.workspace = true
 bones_lib.workspace = true
@@ -18,8 +17,6 @@ bones_ecs.workspace = true
 bones_asset.workspace = true
 bones_schema.workspace = true
 
-wgpu.workspace = true
-winit.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 thiserror.workspace = true

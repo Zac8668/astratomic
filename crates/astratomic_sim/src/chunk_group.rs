@@ -1,171 +1,115 @@
-use core::slice;
+use std::ptr::NonNull;
 
 use crate::prelude::*;
-use async_channel::Sender;
-use itertools::Itertools;
 
-pub type ChunkCorners<'a> = [Option<[&'a mut Atom; QUARTER_CHUNK_LEN]>; 4];
-pub type ChunkSides<'a> = [Option<[&'a mut Atom; HALF_CHUNK_LEN]>; 4];
-
+/// Lightweight 3x3 chunk neighborhood view holding raw pointers to the 9 chunk grids (72 bytes total,
+/// zero heap allocations).
 pub struct ChunkGroup<'a> {
-    pub center: &'a mut [Atom],
-    pub corners: ChunkCorners<'a>,
-    pub sides: ChunkSides<'a>,
-    /// Position of the center chunk.
+    /// Pointers to the 3x3 chunk grids (`[Atom; CHUNK_LEN]`), indexed by `chunk_y * 3 + chunk_x` (`0..9`).
+    /// Index `4` is the center chunk.
+    pub chunks: [Option<NonNull<Atom>>; 9],
+    /// Position of the center chunk (`chunks[4]`).
     pub center_pos: IVec2,
+    pub _marker: std::marker::PhantomData<&'a mut Atom>,
 }
 
+// SAFETY: Within each of the 4 checkerboard passes, active center chunks are separated by 2 chunks
+// along both axes and only access their own neighborhood.
+unsafe impl Send for ChunkGroup<'_> {}
+
 impl ChunkGroup<'_> {
+    #[inline]
     pub fn group_to_chunk(center_pos: IVec2, group_idx: i32) -> IVec2 {
         let x_diff = group_idx % 3 - 1;
         let y_diff = group_idx / 3 - 1;
-
-        let mut pos = center_pos;
-        pos.x += x_diff;
-        pos.y += y_diff;
-
-        pos
+        ivec2(center_pos.x + x_diff, center_pos.y + y_diff)
     }
 
     #[inline]
-    pub fn surrounding_idx(idx: i32) -> i32 {
-        match idx {
-            0 | 1 => 0,
-            2 | 3 => 1,
-            6 | 5 => 2,
-            8 | 7 => 3,
-            _ => panic!("Invalid surrounding idx."),
-        }
+    pub fn center_atom(&self, x: usize, y: usize) -> &Atom {
+        debug_assert!(x < CHUNK_SIZE && y < CHUNK_SIZE);
+        let ptr = self.chunks[4].expect("center chunk must exist");
+        unsafe { &*ptr.as_ptr().add((y << 6) | x) }
     }
 
+    #[inline]
+    pub fn center_atom_mut(&mut self, x: usize, y: usize) -> &mut Atom {
+        debug_assert!(x < CHUNK_SIZE && y < CHUNK_SIZE);
+        let ptr = self.chunks[4].expect("center chunk must exist");
+        unsafe { &mut *ptr.as_ptr().add((y << 6) | x) }
+    }
+
+    #[inline]
     pub fn get_local(&self, idx: (IVec2, i32)) -> Option<&Atom> {
-        let mut pos = idx.0;
-        match idx.1 {
-            // Center
-            4 => Some(&self.center[idx.0.d1()]),
-            // Corners
-            0 | 2 | 6 | 8 => {
-                // Offset position
-                if idx.1 == 0 || idx.1 == 6 {
-                    pos.x -= HALF_CHUNK_LENGHT as i32;
-                }
-                if idx.1 == 0 || idx.1 == 2 {
-                    pos.y -= HALF_CHUNK_LENGHT as i32;
-                }
-
-                let index = pos.y * HALF_CHUNK_LENGHT as i32 + pos.x;
-                let corner_index = ChunkGroup::surrounding_idx(idx.1) as usize;
-
-                if let Some(corners) = &self.corners[corner_index] {
-                    Some(corners[index as usize])
-                } else {
-                    None
-                }
-            }
-            // Sides
-            1 | 3 | 5 | 7 => {
-                // Offset position
-                if idx.1 == 1 {
-                    pos.y -= HALF_CHUNK_LENGHT as i32
-                } else if idx.1 == 3 {
-                    pos.x -= HALF_CHUNK_LENGHT as i32
-                }
-
-                // Gets width accordingly if side is a top/down or left/right
-                let width = if idx.1 == 3 || idx.1 == 5 {
-                    HALF_CHUNK_LENGHT
-                } else {
-                    CHUNK_LENGHT
-                } as i32;
-
-                let index = pos.y * width + pos.x;
-                let side_index = ChunkGroup::surrounding_idx(idx.1) as usize;
-
-                if let Some(sides) = &self.sides[side_index] {
-                    Some(sides[index as usize])
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        let (pos, group_idx) = idx;
+        if !(0..9).contains(&group_idx)
+            || pos.x < 0
+            || pos.x >= CHUNK_LENGHT as i32
+            || pos.y < 0
+            || pos.y >= CHUNK_LENGHT as i32
+        {
+            return None;
         }
+        self.get_global(local_to_global(idx))
     }
 
+    #[inline]
     pub fn get_mut_local(&mut self, idx: (IVec2, i32)) -> Option<&mut Atom> {
-        let mut pos = idx.0;
-        match idx.1 {
-            // Center
-            4 => Some(&mut self.center[idx.0.d1()]),
-            // Corners
-            0 | 2 | 6 | 8 => {
-                // Offset position
-                if idx.1 == 0 || idx.1 == 6 {
-                    pos.x -= HALF_CHUNK_LENGHT as i32;
-                }
-                if idx.1 == 0 || idx.1 == 2 {
-                    pos.y -= HALF_CHUNK_LENGHT as i32;
-                }
-
-                let index = pos.y * HALF_CHUNK_LENGHT as i32 + pos.x;
-                let corner_index = ChunkGroup::surrounding_idx(idx.1) as usize;
-
-                if let Some(corners) = &mut self.corners[corner_index] {
-                    Some(corners[index as usize])
-                } else {
-                    None
-                }
-            }
-            // Sides
-            1 | 3 | 5 | 7 => {
-                // Offset position
-                if idx.1 == 1 {
-                    pos.y -= HALF_CHUNK_LENGHT as i32
-                } else if idx.1 == 3 {
-                    pos.x -= HALF_CHUNK_LENGHT as i32
-                }
-
-                // Gets width accordingly if side is a top/down or left/right
-                let width = if idx.1 == 3 || idx.1 == 5 {
-                    HALF_CHUNK_LENGHT
-                } else {
-                    CHUNK_LENGHT
-                } as i32;
-
-                let index = pos.y * width + pos.x;
-                let side_index = ChunkGroup::surrounding_idx(idx.1) as usize;
-
-                if let Some(sides) = &mut self.sides[side_index] {
-                    Some(sides[index as usize])
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        let (pos, group_idx) = idx;
+        if !(0..9).contains(&group_idx)
+            || pos.x < 0
+            || pos.x >= CHUNK_LENGHT as i32
+            || pos.y < 0
+            || pos.y >= CHUNK_LENGHT as i32
+        {
+            return None;
         }
+        self.get_mut_global(local_to_global(idx))
     }
 
+    #[inline]
     pub fn get_global(&self, idx: IVec2) -> Option<&Atom> {
-        let local_idx = global_to_local(idx);
-        self.get_local(local_idx)
+        const MIN_B: i32 = HALF_CHUNK_LENGHT as i32;
+        const MAX_B: i32 = (CHUNK_LENGHT * 2 + HALF_CHUNK_LENGHT) as i32;
+        if idx.x < MIN_B || idx.x >= MAX_B || idx.y < MIN_B || idx.y >= MAX_B {
+            return None;
+        }
+        let gx = idx.x as usize;
+        let gy = idx.y as usize;
+        let group_idx = (gy >> 6) * 3 + (gx >> 6);
+        let atom_idx = ((gy & 63) << 6) | (gx & 63);
+        let ptr = self.chunks[group_idx]?;
+        unsafe { Some(&*ptr.as_ptr().add(atom_idx)) }
     }
 
+    #[inline]
     pub fn get_mut_global(&mut self, idx: IVec2) -> Option<&mut Atom> {
-        let local_idx = global_to_local(idx);
-        self.get_mut_local(local_idx)
+        const MIN_B: i32 = HALF_CHUNK_LENGHT as i32;
+        const MAX_B: i32 = (CHUNK_LENGHT * 2 + HALF_CHUNK_LENGHT) as i32;
+        if idx.x < MIN_B || idx.x >= MAX_B || idx.y < MIN_B || idx.y >= MAX_B {
+            return None;
+        }
+        let gx = idx.x as usize;
+        let gy = idx.y as usize;
+        let group_idx = (gy >> 6) * 3 + (gx >> 6);
+        let atom_idx = ((gy & 63) << 6) | (gx & 63);
+        let ptr = self.chunks[group_idx]?;
+        unsafe { Some(&mut *ptr.as_ptr().add(atom_idx)) }
     }
 }
 
-// Two ways to index a ChunkGroup to get an atom, by a global(IVec2) and by a local(IVec2, i32) pos
-// Use get_* if you want an Option instead
 impl std::ops::Index<IVec2> for ChunkGroup<'_> {
     type Output = Atom;
     #[track_caller]
+    #[inline]
     fn index(&self, idx: IVec2) -> &Self::Output {
         self.get_global(idx).expect("Invalid index position.")
     }
 }
+
 impl std::ops::IndexMut<IVec2> for ChunkGroup<'_> {
     #[track_caller]
+    #[inline]
     fn index_mut(&mut self, idx: IVec2) -> &mut Self::Output {
         self.get_mut_global(idx).expect("Invalid index position.")
     }
@@ -174,310 +118,178 @@ impl std::ops::IndexMut<IVec2> for ChunkGroup<'_> {
 impl std::ops::Index<(IVec2, i32)> for ChunkGroup<'_> {
     type Output = Atom;
     #[track_caller]
+    #[inline]
     fn index(&self, idx: (IVec2, i32)) -> &Self::Output {
         self.get_local(idx).expect("Invalid index position.")
     }
 }
+
 impl std::ops::IndexMut<(IVec2, i32)> for ChunkGroup<'_> {
     #[track_caller]
+    #[inline]
     fn index_mut(&mut self, idx: (IVec2, i32)) -> &mut Self::Output {
         self.get_mut_local(idx).expect("Invalid index position.")
     }
 }
 
-/// Transforms global 3x3 chunk position to local 3x3 chunks position
-/// Used for chunk multithreaded updates
+/// Transforms global 3x3 chunk position to local `(0..64, 0..64)` chunk position and group index `0..9`.
+#[inline]
 pub fn global_to_local(pos: IVec2) -> (IVec2, i32) {
-    let range = 0..CHUNK_LENGHT as i32 * 3;
-    if !range.contains(&pos.x) || !range.contains(&pos.y) {
-        panic!("Invalid position on global_to_local.")
-    }
-
-    let chunk_lenght = CHUNK_LENGHT as i32;
-
-    let chunk_x = pos.x % (chunk_lenght * 3) / chunk_lenght;
-    let chunk_y = pos.y / chunk_lenght;
-
-    let local_x = pos.x - chunk_x * chunk_lenght;
-    let local_y = pos.y - chunk_y * chunk_lenght;
-
-    let chunk_index = chunk_y * 3 + chunk_x;
-
-    (IVec2::new(local_x, local_y), chunk_index)
+    debug_assert!(
+        (0..(CHUNK_LENGHT as i32 * 3)).contains(&pos.x)
+            && (0..(CHUNK_LENGHT as i32 * 3)).contains(&pos.y),
+        "Invalid position on global_to_local: {pos:?}"
+    );
+    let gx = pos.x as usize;
+    let gy = pos.y as usize;
+    let chunk_x = (gx >> 6) as i32;
+    let chunk_y = (gy >> 6) as i32;
+    let local_x = (gx & 63) as i32;
+    let local_y = (gy & 63) as i32;
+    (IVec2::new(local_x, local_y), chunk_y * 3 + chunk_x)
 }
 
-/// Transforms local 3x3 chunk position to global 3x3 chunks position
-/// Used for chunk multithreaded updates
+/// Transforms local `(0..64, 0..64)` chunk position and group index `0..9` to global 3x3 chunk position.
+#[inline]
 pub fn local_to_global(pos: (IVec2, i32)) -> IVec2 {
-    let range = 0..CHUNK_LENGHT as i32;
-    if !range.contains(&pos.0.x) || !range.contains(&pos.0.y) || !(0..9).contains(&pos.1) {
-        panic!(
-            "Invalid position on local_to_global. {} {} {}",
-            pos.0.x, pos.0.y, pos.1
-        )
-    }
-
-    let chunk_size = CHUNK_LENGHT as i32;
-
+    debug_assert!(
+        (0..CHUNK_LENGHT as i32).contains(&pos.0.x)
+            && (0..CHUNK_LENGHT as i32).contains(&pos.0.y)
+            && (0..9).contains(&pos.1),
+        "Invalid position on local_to_global: {pos:?}"
+    );
     let chunk_index = pos.1;
-
     let chunk_x = chunk_index % 3;
     let chunk_y = chunk_index / 3;
-
-    let global_x = pos.0.x + chunk_size * chunk_x;
-    let global_y = pos.0.y + chunk_size * chunk_y;
-
-    IVec2::new(global_x, global_y)
+    IVec2::new(pos.0.x + (chunk_x << 6), pos.0.y + (chunk_y << 6))
 }
 
-//This function gets and updates the chunk groups parallely
-pub fn update_chunk_groups<'a>(
-    chunks: &'a mut HashMap<IVec2, Chunk>,
+fn merge_rect_map(dst: &mut HashMap<IVec2, URect>, src: HashMap<IVec2, URect>) {
+    for (chunk, rect) in src {
+        if let Some(existing) = dst.get_mut(&chunk) {
+            existing.min = existing.min.min(rect.min);
+            existing.max = existing.max.max(rect.max);
+        } else {
+            dst.insert(chunk, rect);
+        }
+    }
+}
+
+/// Prepares and updates all matching chunk groups for a single `(x_toff, y_toff)` checkerboard pass.
+pub fn update_chunk_groups(
+    chunks: &mut HashMap<IVec2, Chunk>,
     (x_toff, y_toff): (i32, i32),
-    dirty_rects: &'a HashMap<IVec2, URect>,
+    dirty_rects: &HashMap<IVec2, URect>,
     manager_pos: IVec2,
-    senders: (
-        &'a Sender<DeferredDirtyRectUpdate>,
-        &'a Sender<DeferredDirtyRectUpdate>,
-    ),
-    update: (u8, &'a Materials),
-    scope: &Scope<'a, '_, ()>,
+    new_dirty_rects: &mut HashMap<IVec2, URect>,
+    render_dirty_rects: &mut HashMap<IVec2, URect>,
+    (dt, materials): (u8, &Materials),
 ) {
     puffin::profile_function!();
 
-    let (dirty_update_rect_send, dirty_render_rect_send) = senders;
-    let (dt, materials) = update;
+    let mx_parity = manager_pos.x.abs() & 1;
+    let my_parity = manager_pos.y.abs() & 1;
 
-    // Ensure Copy-on-Write (`Arc::make_mut`) is performed before parallel tasks take raw pointers
-    // into any shared `Arc<ChunkGrid>` instances.
-    let active_centers: Vec<IVec2> = dirty_rects
-        .keys()
-        .copied()
-        .filter(|chunk_pos| {
-            let same_x = (chunk_pos.x + x_toff + manager_pos.x.abs() % 2) % 2 == 0;
-            let same_y = (chunk_pos.y + y_toff + manager_pos.y.abs() % 2) % 2 == 0;
-            same_x && same_y && chunks.contains_key(chunk_pos)
+    let active_centers: Vec<(IVec2, URect)> = dirty_rects
+        .iter()
+        .filter_map(|(&chunk_pos, &rect)| {
+            let same_x = (chunk_pos.x + x_toff + mx_parity).rem_euclid(2) == 0;
+            let same_y = (chunk_pos.y + y_toff + my_parity).rem_euclid(2) == 0;
+            (same_x && same_y && chunks.contains_key(&chunk_pos)).then_some((chunk_pos, rect))
         })
         .collect();
 
-    for center_pos in &active_centers {
-        for (x_off, y_off) in (-1..=1).cartesian_product(-1..=1) {
-            if let Some(chunk) = chunks.get_mut(&(*center_pos + ivec2(x_off, y_off))) {
-                let _ = std::sync::Arc::make_mut(&mut chunk.grid);
+    if active_centers.is_empty() {
+        return;
+    }
+
+    // 1. Perform Copy-on-Write (`Arc::make_mut`) on all chunks in the 3x3 neighborhoods up front
+    // so every active `ChunkGrid` is uniquely owned and has a stable memory address.
+    for &(center_pos, _) in &active_centers {
+        for gy in -1..=1 {
+            for gx in -1..=1 {
+                if let Some(chunk) = chunks.get_mut(&(center_pos + ivec2(gx, gy))) {
+                    let _ = std::sync::Arc::make_mut(&mut chunk.grid);
+                }
             }
         }
     }
 
-    for chunk_pos in dirty_rects.keys() {
-        //Get chunks mutable reference from it's pointer
-        let chunks_ptr: *mut HashMap<IVec2, Chunk> = chunks;
-        let chunks;
-        unsafe {
-            chunks = chunks_ptr.as_mut().unwrap();
-        }
-
-        scope.spawn(async move {
-            //If not a center chunk in our current update step, or we don't have the chunk, continue
-            let same_x = (chunk_pos.x + x_toff + manager_pos.x.abs() % 2) % 2 == 0;
-            let same_y = (chunk_pos.y + y_toff + manager_pos.y.abs() % 2) % 2 == 0;
-
-            if !same_x || !same_y || !chunks.contains_key(chunk_pos) {
-                return;
-            }
-
-            //Get center and create group
-            let center_chunk = chunks.get_mut(chunk_pos).unwrap();
-            let first = std::sync::Arc::make_mut(&mut center_chunk.grid)
-                .atoms
-                .as_mut_ptr();
-            let center;
-            unsafe {
-                center = slice::from_raw_parts_mut(first, CHUNK_LEN);
-            }
-
-            let mut chunk_group = ChunkGroup {
-                center,
-                sides: [None, None, None, None],
-                corners: [None, None, None, None],
-                center_pos: *chunk_pos,
-            };
-
-            //Get chunk surroundings
-            for (x_off, y_off) in (-1..=1).cartesian_product(-1..=1) {
-                let off = ivec2(x_off, y_off);
-
-                match (x_off, y_off) {
-                    // UP and DOWN
-                    (0, -1) | (0, 1) => {
-                        let Some(chunk) = chunks.get_mut(&(*chunk_pos + off)) else {
-                            continue;
-                        };
-
-                        let mut start_ptr =
-                            std::sync::Arc::make_mut(&mut chunk.grid).atoms.as_mut_ptr();
-                        if y_off == -1 {
-                            unsafe {
-                                start_ptr = start_ptr.add(HALF_CHUNK_LEN);
-                            }
-                        }
-
-                        let mut atoms = vec![];
-                        for i in 0..HALF_CHUNK_LEN {
-                            unsafe {
-                                atoms.push(start_ptr.add(i).as_mut().unwrap());
-                            }
-                        }
-
-                        chunk_group.sides[if y_off == -1 { 0 } else { 3 }] =
-                            Some(atoms.try_into().unwrap());
-                    }
-                    //LEFT and RIGHT
-                    (-1, 0) | (1, 0) => {
-                        let Some(chunk) = chunks.get_mut(&(*chunk_pos + off)) else {
-                            continue;
-                        };
-
-                        let start_ptr =
-                            std::sync::Arc::make_mut(&mut chunk.grid).atoms.as_mut_ptr();
-
-                        let mut atoms = vec![];
-                        let mut add_off = match x_off {
-                            -1 => HALF_CHUNK_LENGHT,
-                            1 => 0,
-                            _ => unreachable!(),
-                        };
-
-                        for i in 0..HALF_CHUNK_LEN {
-                            if i % HALF_CHUNK_LENGHT == 0 && i != 0 {
-                                add_off += HALF_CHUNK_LENGHT;
-                            }
-
-                            unsafe {
-                                atoms.push(start_ptr.add(i + add_off).as_mut().unwrap());
-                            }
-                        }
-
-                        chunk_group.sides[if x_off == -1 { 1 } else { 2 }] =
-                            Some(atoms.try_into().unwrap());
-                    }
-                    //CORNERS
-                    (-1, -1) | (1, -1) | (-1, 1) | (1, 1) => {
-                        let Some(chunk) = chunks.get_mut(&(*chunk_pos + off)) else {
-                            continue;
-                        };
-
-                        let start_ptr =
-                            std::sync::Arc::make_mut(&mut chunk.grid).atoms.as_mut_ptr();
-
-                        let mut atoms = vec![];
-                        let mut add_off = match (x_off, y_off) {
-                            (1, 1) => 0,
-                            (-1, 1) => HALF_CHUNK_LENGHT,
-                            (1, -1) => HALF_CHUNK_LEN,
-                            (-1, -1) => HALF_CHUNK_LEN + HALF_CHUNK_LENGHT,
-
-                            _ => unreachable!(),
-                        };
-
-                        for i in 0..QUARTER_CHUNK_LEN {
-                            if i % HALF_CHUNK_LENGHT == 0 && i != 0 {
-                                add_off += HALF_CHUNK_LENGHT;
-                            }
-
-                            unsafe {
-                                atoms.push(start_ptr.add(i + add_off).as_mut().unwrap());
-                            }
-                        }
-
-                        let corner_idx = match (x_off, y_off) {
-                            (1, 1) => 3,
-                            (-1, 1) => 2,
-                            (1, -1) => 1,
-                            (-1, -1) => 0,
-
-                            _ => unreachable!(),
-                        };
-
-                        chunk_group.corners[corner_idx] = Some(atoms.try_into().unwrap());
-                    }
-                    // CENTER
-                    (0, 0) => { /*We alredy got the center*/ }
-                    _ => unreachable!(),
+    // 2. Build the 72-byte `ChunkGroup` pointer tables on the main thread without touching `HashMap`
+    // from worker threads.
+    let mut groups: Vec<(ChunkGroup<'_>, URect)> = Vec::with_capacity(active_centers.len());
+    for (center_pos, rect) in active_centers {
+        let mut ptrs: [Option<NonNull<Atom>>; 9] = [None; 9];
+        for gy in 0..3_i32 {
+            for gx in 0..3_i32 {
+                let pos = center_pos + ivec2(gx - 1, gy - 1);
+                if let Some(chunk) = chunks.get_mut(&pos) {
+                    let raw_ptr = std::sync::Arc::make_mut(&mut chunk.grid).atoms.as_mut_ptr();
+                    ptrs[(gy * 3 + gx) as usize] = NonNull::new(raw_ptr);
                 }
             }
+        }
+        groups.push((
+            ChunkGroup {
+                chunks: ptrs,
+                center_pos,
+                _marker: std::marker::PhantomData,
+            },
+            rect,
+        ));
+    }
 
-            let rect = dirty_rects.get(&chunk_group.center_pos).unwrap();
+    // 3. For small counts, run directly on the current thread without thread-spawn overhead.
+    if groups.len() <= 2 {
+        for (group, rect) in &mut groups {
             update_chunks(
                 &mut UpdateChunksType {
-                    group: &mut chunk_group,
-                    dirty_update_rect_send,
-                    dirty_render_rect_send,
+                    group,
+                    dirty_update_rects: new_dirty_rects,
+                    dirty_render_rects: render_dirty_rects,
                     materials,
                 },
                 dt,
                 rect,
-            )
-        });
+            );
+        }
+        return;
     }
+
+    // 4. Partition work across bounded worker threads and merge thread-local dirty rect maps.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    let batch_size = groups.len().div_ceil(threads).max(1);
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(threads);
+        for slice in groups.chunks_mut(batch_size) {
+            handles.push(s.spawn(move || {
+                let mut local_update = HashMap::with_capacity(slice.len() * 2);
+                let mut local_render = HashMap::with_capacity(slice.len() * 2);
+                for (group, rect) in slice {
+                    update_chunks(
+                        &mut UpdateChunksType {
+                            group,
+                            dirty_update_rects: &mut local_update,
+                            dirty_render_rects: &mut local_render,
+                            materials,
+                        },
+                        dt,
+                        rect,
+                    );
+                }
+                (local_update, local_render)
+            }));
+        }
+
+        for handle in handles {
+            if let Ok((local_update, local_render)) = handle.join() {
+                merge_rect_map(new_dirty_rects, local_update);
+                merge_rect_map(render_dirty_rects, local_render);
+            }
+        }
+    });
 }
-
-/*#[test]
-fn update_test() {
-    //Get Chunk Manager
-    let mut chunk_manager = ChunkManager::default();
-
-    //Get materials
-    let materials = &Materials(vec![
-        Material::Void,
-        Material::Object,
-        Material::Powder {
-            inertial_resistance: 0.1,
-        },
-        Material::Liquid { flow: 5 },
-        Material::Powder {
-            inertial_resistance: 0.92,
-        },
-        Material::Liquid { flow: 1 },
-        Material::Solid,
-        Material::Solid,
-        Material::Solid,
-    ]);
-
-    //Add some chunks with full dirty rects
-    let mut dirty_rects = HashMap::new();
-    for (x, y) in (chunk_manager.pos.x..chunk_manager.pos.x + 1)
-        .cartesian_product(chunk_manager.pos.y..chunk_manager.pos.y + 1)
-    {
-        let index = ivec2(x, y);
-        chunk_manager
-            .chunks
-            .insert(index, Chunk::new(Handle::default(), index));
-        dirty_rects.insert(index, URect::new(0, 0, 63, 63));
-    }
-
-    let manager_pos = ivec2(chunk_manager.pos.x, chunk_manager.pos.y);
-    let dt = 0;
-
-    //Update
-    // Create channel for sending dirty update rects
-    let (dirty_update_rects_send, _) = async_channel::unbounded::<DeferredDirtyRectUpdate>();
-    let dirty_update_rect_send = &dirty_update_rects_send;
-
-    // Create channel for sending dirty render rect updates
-    let (dirty_render_rects_send, _) = async_channel::unbounded::<DeferredDirtyRectUpdate>();
-    let dirty_render_rect_send = &dirty_render_rects_send;
-
-    for (y_toff, x_toff) in rand_range(0..2)
-        .into_iter()
-        .cartesian_product(rand_range(0..2).into_iter())
-    {
-        update_chunk_groups(
-            &mut chunk_manager.chunks,
-            (x_toff, y_toff),
-            &dirty_rects,
-            manager_pos,
-            (dirty_update_rect_send, dirty_render_rect_send),
-            (dt, materials),
-        );
-    }
-}*/

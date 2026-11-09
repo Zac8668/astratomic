@@ -2,4 +2,5 @@
 .vscode/
 /assets/world/**
 !/assets/world/.gitkeep
+/saves/
 .cargo/config.toml

@@ -9,8 +9,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-astratomic_sim.workspace = true
-
 bones_framework.workspace = true
 bones_lib.workspace = true
 bones_ecs.workspace = true
