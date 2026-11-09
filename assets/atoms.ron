@@ -1,34 +1,34 @@
 ([
     //0 Void
-    (default_state: Void),
+    (default_state: Void, weight: 0.0),
     //1 Dummy atom
-    (default_state: Object),
+    (default_state: Object, weight: 10.0),
     //2 Sand
-    ( inertial_resistance: 0.1, default_state: Powder),
+    ( inertial_resistance: 0.1, default_state: Powder, weight: 1.5),
     //3 Water
-    ( flow: 5, damage: 0.0, default_state: Liquid),
+    ( flow: 5, damage: 0.0, default_state: Liquid, weight: 0.0001),
     //4 Gravel
-    ( inertial_resistance: 0.60, default_state: Powder),
+    ( inertial_resistance: 0.60, default_state: Powder, weight: 2.0),
     //5 Lava
-    ( flow: 1, damage: 15.0, default_state: Liquid),
+    ( flow: 1, damage: 15.0, default_state: Liquid, weight: 2.5),
     //6 Grass
-    (default_state: Solid),
+    (default_state: Solid, weight: 0.5),
     //7 Dirt
-    (default_state: Solid),
+    (default_state: Solid, weight: 1.3),
     //8 Rock
-    (default_state: Solid),
+    (default_state: Solid, weight: 2.5),
     //9 Acid
-    ( flow: 5, damage: 3.0, default_state: Liquid),
+    ( flow: 5, damage: 3.0, default_state: Liquid, weight: 1.1),
     //10 Compacted dirt
-    (default_state: Solid),
+    (default_state: Solid, weight: 1.6),
     //11 Leaves
-    (default_state: Solid),
+    (default_state: Solid, weight: 0.3),
     //12 Wood
-    (default_state: Solid),
+    (default_state: Solid, weight: 0.7),
     //13 Coal
-    (default_state: Solid),
+    (default_state: Solid, weight: 1.3),
     //14 Iron ore
-    (default_state: Solid),
+    (default_state: Solid, weight: 5.0),
     //15 Gold ore
-    (default_state: Solid)
+    (default_state: Solid, weight: 10.0)
 ])

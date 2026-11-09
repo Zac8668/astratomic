@@ -219,6 +219,7 @@ pub fn setup_player_system(
             vel: Vec2::ZERO,
             half_size: PLAYER_HALF_SIZE,
             step_height: PLAYER_STEP_HEIGHT,
+            weight: 70.0,
             grounded: true,
             ground_normal: Vec2::Y,
         },
@@ -469,6 +470,7 @@ pub fn player_controller_system(
             actor.vel.y = JUMP_MAG;
             actor.grounded = false;
             state.coyote_ticks = 0;
+            state.jumped_this_tick = true;
             jumped_this_tick = true;
         }
 

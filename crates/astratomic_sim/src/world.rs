@@ -274,6 +274,12 @@ impl ChunkWorld {
         chunk.grid.atoms.get(pos.atom.d1())
     }
 
+    /// Read atom at global grid coordinates `(gx, gy)`.
+    #[inline]
+    pub fn get_atom_global(&self, gx: i32, gy: i32) -> Option<&Atom> {
+        self.get_atom(&global_to_chunk(ivec2(gx, gy)))
+    }
+
     /// Obtain a mutable reference to an atom at `pos`, performing Copy-on-Write on the chunk's
     /// `Arc<ChunkGrid>` via `Arc::make_mut(&mut chunk.grid)`.
     pub fn get_mut_atom(&mut self, pos: ChunkPos) -> Option<&mut Atom> {
@@ -289,6 +295,18 @@ impl ChunkWorld {
         };
         *slot = atom;
         true
+    }
+
+    /// Set the atom at global grid coordinates `(gx, gy)` using Copy-on-Write.
+    #[inline]
+    pub fn set_atom_global(&mut self, gx: i32, gy: i32, atom: Atom) -> bool {
+        self.set_atom(global_to_chunk(ivec2(gx, gy)), atom)
+    }
+
+    /// Check if the atom at global grid coordinates `(gx, gy)` is air (or return false if chunk unloaded).
+    #[inline]
+    pub fn is_air_global(&self, gx: i32, gy: i32) -> bool {
+        self.get_atom_global(gx, gy).map(|a| a.is_air()).unwrap_or(false)
     }
 
     /// Paint a single global atom position and mark both update and render dirty rects.

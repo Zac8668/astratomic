@@ -18,6 +18,7 @@ bones_asset.workspace = true
 bones_schema.workspace = true
 
 bytemuck.workspace = true
+fastrand = "2.5"
 glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true

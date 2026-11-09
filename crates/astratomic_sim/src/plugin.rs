@@ -3,6 +3,7 @@ use bones_framework::prelude::*;
 use crate::{
     atom::{Atom, AtomState, Material, Materials},
     chunk::Chunk,
+    particle::{Particle, ParticlePool, simulate_particles_system},
     world::{
         ChunkGeneratorHook, ChunkPos, ChunkWorld, DirtyRects, MaterialsAssetTracker,
         SimulationSettings, URect, chunk_world_update_system, hot_reload_materials_system,
@@ -26,6 +27,8 @@ pub fn register_sim_schemas() {
     URect::register_schema();
     ChunkPos::register_schema();
     WorldIoWorker::register_schema();
+    Particle::register_schema();
+    ParticlePool::register_schema();
 }
 
 /// Bones plugin for `astratomic_sim` that initializes chunk world state, procedural generation,
@@ -50,12 +53,14 @@ impl SessionPlugin for AstratomicSimPlugin {
         session.world.init_resource::<Materials>();
         session.world.init_resource::<MaterialsAssetTracker>();
         session.world.init_resource::<WorldIoWorker>();
+        session.world.init_resource::<ParticlePool>();
 
         session
             .add_system_to_stage(CoreStage::Startup, setup_chunk_world_system)
             .add_system_to_stage(CoreStage::PreUpdate, hot_reload_materials_system)
             .add_system_to_stage(CoreStage::PreUpdate, poll_chunk_io_system)
             .add_system_to_stage(CoreStage::PreUpdate, stream_chunk_window_system)
-            .add_system_to_stage(CoreStage::Update, chunk_world_update_system);
+            .add_system_to_stage(CoreStage::Update, chunk_world_update_system)
+            .add_system_to_stage(CoreStage::Update, simulate_particles_system);
     }
 }

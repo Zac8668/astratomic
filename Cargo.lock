@@ -333,6 +333,7 @@ dependencies = [
  "bones_lib",
  "bones_schema",
  "bytemuck",
+ "fastrand 2.5.0",
  "glam 0.24.2",
  "serde",
  "thiserror 2.0.21",

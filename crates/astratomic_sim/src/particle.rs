@@ -1,0 +1,680 @@
+//! Deterministic, multiplayer-ready particle simulation resource and system for `bones_ecs`.
+
+use std::sync::Arc;
+
+use bones_framework::prelude::*;
+use bones_schema::HasSchema;
+
+use crate::{
+    atom::Atom,
+    world::{
+        ChunkWorld, DirtyRects, global_to_chunk, update_dirty_rects,
+        update_dirty_rects_3x3,
+    },
+};
+
+/// Reuses `FLAG_SLIDE_LEFT` while in flight to indicate that an ephemeral FX particle bounces.
+pub const FLAG_PARTICLE_BOUNCE: u8 = 1 << 2;
+
+/// Maximum number of active particles permitted in the particle pool.
+pub const MAX_PARTICLES: usize = 16_384;
+
+/// Downward gravity acceleration per simulation tick applied to particles (+Y is down).
+pub const PARTICLE_GRAVITY: f32 = 0.25;
+
+/// Air drag multiplier applied to particle velocity each tick.
+pub const PARTICLE_AIR_DRAG: f32 = 0.995;
+
+/// Maximum velocity magnitude in pixels per tick.
+pub const MAX_PARTICLE_SPEED: f32 = 24.0;
+
+/// Compact 24-byte POD particle representation stored in a flat array.
+#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable, HasSchema)]
+#[schema(opaque)]
+#[repr(C)]
+pub struct Particle {
+    /// Sub-pixel world coordinates (x, y) in simulation pixel space.
+    pub pos: [f32; 2],
+    /// Velocity in simulation pixels per tick (vx, vy).
+    pub vel: [f32; 2],
+    /// The 8-byte [`Atom`] (preserves `material_id`, RGBA8 color, flags, and 5-bit life).
+    pub atom: Atom,
+}
+
+const _: [(); 24] = [(); std::mem::size_of::<Particle>()];
+
+/// Unified pool resource handling both matter-carrying atoms and ephemeral FX particles.
+///
+/// Backed by an `Arc<Vec<Particle>>` with Copy-on-Write semantics so rollback snapshots
+/// are zero-copy when idle.
+#[derive(Clone, HasSchema, Default, Debug)]
+pub struct ParticlePool {
+    pub active: Arc<Vec<Particle>>,
+}
+
+impl ParticlePool {
+    /// Create a new empty particle pool.
+    pub fn new() -> Self {
+        Self {
+            active: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Push a particle to the pool if below [`MAX_PARTICLES`].
+    pub fn push_particle(&mut self, particle: Particle) {
+        let list = Arc::make_mut(&mut self.active);
+        if list.len() < MAX_PARTICLES {
+            list.push(particle);
+        }
+    }
+
+    /// Eject a matter-carrying atom from [`ChunkWorld`] into the particle pool.
+    ///
+    /// Reads `atom` at `(gx, gy)`. If not air or an immovable object, replaces it with
+    /// [`Atom::AIR`] and spawns a real-matter particle (`life_5bit() == 0`).
+    pub fn eject_from_grid(
+        &mut self,
+        world: &mut ChunkWorld,
+        gx: i32,
+        gy: i32,
+        vel: [f32; 2],
+    ) -> bool {
+        let chunk_pos = global_to_chunk(ivec2(gx, gy));
+        let Some(&existing) = world.get_atom(&chunk_pos) else {
+            return false;
+        };
+        if existing.is_air() || existing.is_object() {
+            return false;
+        }
+
+        let mut atom = existing;
+        if !world.set_atom(chunk_pos, Atom::AIR) {
+            return false;
+        }
+
+        atom.set_free_falling(true);
+        atom.set_life_5bit(0);
+        atom.vx = 0;
+        atom.vy = 0;
+
+        self.push_particle(Particle {
+            pos: [gx as f32 + 0.5, gy as f32 + 0.5],
+            vel,
+            atom,
+        });
+        true
+    }
+
+    /// Eject a matter-carrying atom and mark dirty rects.
+    pub fn eject_from_grid_dirty(
+        &mut self,
+        world: &mut ChunkWorld,
+        dirty_rects: &mut DirtyRects,
+        gx: i32,
+        gy: i32,
+        vel: [f32; 2],
+    ) -> bool {
+        let success = self.eject_from_grid(world, gx, gy, vel);
+        if success {
+            let chunk_pos = global_to_chunk(ivec2(gx, gy));
+            update_dirty_rects_3x3(&mut dirty_rects.current, chunk_pos);
+            update_dirty_rects(&mut dirty_rects.render, chunk_pos);
+        }
+        success
+    }
+
+    /// Spawn an ephemeral visual effects particle.
+    pub fn spawn_fx(
+        &mut self,
+        pos: [f32; 2],
+        vel: [f32; 2],
+        color: [u8; 4],
+        lifetime_ticks: u8,
+        bounces: bool,
+    ) {
+        let mut atom = Atom {
+            color,
+            material_id: 0,
+            flags: if bounces { FLAG_PARTICLE_BOUNCE } else { 0 },
+            vx: 0,
+            vy: 0,
+        };
+        atom.set_life_5bit(lifetime_ticks.clamp(1, 31));
+        self.push_particle(Particle { pos, vel, atom });
+    }
+
+    /// Returns the number of active particles.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.active.len()
+    }
+
+    /// Returns `true` if there are no active particles.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
+    }
+
+    /// Clear all active particles.
+    pub fn clear(&mut self) {
+        if !self.active.is_empty() {
+            self.active = Arc::new(Vec::new());
+        }
+    }
+
+    /// Read-only slice view of all active particles.
+    #[inline]
+    pub fn particles(&self) -> &[Particle] {
+        &self.active
+    }
+}
+
+/// Pure integer Bresenham line iterator stepping from `start` to `end` (skipping `start`).
+#[derive(Debug, Clone, Copy)]
+pub struct Bresenham {
+    curr_x: i32,
+    curr_y: i32,
+    end_x: i32,
+    end_y: i32,
+    dx: i32,
+    dy: i32,
+    sx: i32,
+    sy: i32,
+    err: i32,
+}
+
+impl Bresenham {
+    /// Create a new Bresenham line iterator from `start` to `end`.
+    pub fn new(start: (i32, i32), end: (i32, i32)) -> Self {
+        let dx = (end.0 - start.0).abs();
+        let dy = -(end.1 - start.1).abs();
+        let sx = if start.0 < end.0 { 1 } else { -1 };
+        let sy = if start.1 < end.1 { 1 } else { -1 };
+        let err = dx + dy;
+        Self {
+            curr_x: start.0,
+            curr_y: start.1,
+            end_x: end.0,
+            end_y: end.1,
+            dx,
+            dy,
+            sx,
+            sy,
+            err,
+        }
+    }
+}
+
+impl Iterator for Bresenham {
+    type Item = (i32, i32);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curr_x == self.end_x && self.curr_y == self.end_y {
+            return None;
+        }
+        let e2 = 2 * self.err;
+        if e2 >= self.dy {
+            self.err += self.dy;
+            self.curr_x += self.sx;
+        }
+        if e2 <= self.dx {
+            self.err += self.dx;
+            self.curr_y += self.sy;
+        }
+        Some((self.curr_x, self.curr_y))
+    }
+}
+
+/// Re-insert a matter-carrying atom back into [`ChunkWorld`] at or near `(lx, ly)`.
+///
+/// If `(lx, ly)` is air, the atom is written directly. If already occupied, searches
+/// deterministic rings (`radius = 1..=2`) in fixed offset order for the first air cell
+/// to guarantee matter conservation.
+pub fn reinsert_particle_atom(
+    world: &mut ChunkWorld,
+    lx: i32,
+    ly: i32,
+    vel: [f32; 2],
+    atom: Atom,
+    current_tick: u64,
+) -> bool {
+    reinsert_particle_atom_with_dirty(world, None, lx, ly, vel, atom, current_tick)
+}
+
+/// Re-insert a matter-carrying atom back into [`ChunkWorld`] and update dirty rects if provided.
+pub fn reinsert_particle_atom_with_dirty(
+    world: &mut ChunkWorld,
+    mut dirty_rects: Option<&mut DirtyRects>,
+    lx: i32,
+    ly: i32,
+    vel: [f32; 2],
+    mut atom: Atom,
+    current_tick: u64,
+) -> bool {
+    atom.set_free_falling(true);
+    atom.mark_updated(current_tick);
+    atom.vx = (vel[0] * 0.5).round().clamp(-6.0, 6.0) as i8;
+    atom.vy = 0;
+
+    // 1. Check primary target cell (lx, ly)
+    let primary_pos = global_to_chunk(ivec2(lx, ly));
+    if let Some(target) = world.get_atom(&primary_pos) {
+        if target.is_air() {
+            world.set_atom(primary_pos, atom);
+            if let Some(ref mut dr) = dirty_rects {
+                update_dirty_rects_3x3(&mut dr.current, primary_pos);
+                update_dirty_rects(&mut dr.render, primary_pos);
+            }
+            return true;
+        }
+    }
+
+    // 2. Search deterministic neighbor rings radius = 1..=2
+    for radius in 1i32..=2 {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs().max(dy.abs()) == radius {
+                    let nx = lx + dx;
+                    let ny = ly + dy;
+                    let npos = global_to_chunk(ivec2(nx, ny));
+                    if let Some(target) = world.get_atom(&npos) {
+                        if target.is_air() {
+                            world.set_atom(npos, atom);
+                            if let Some(ref mut dr) = dirty_rects {
+                                update_dirty_rects_3x3(&mut dr.current, npos);
+                                update_dirty_rects(&mut dr.render, npos);
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Advance all particles in `pool` by one deterministic simulation tick.
+pub fn step_particle_simulation(
+    pool: &mut ParticlePool,
+    world: &mut ChunkWorld,
+    mut dirty_rects: Option<&mut DirtyRects>,
+    current_tick: u64,
+) {
+    if pool.active.is_empty() {
+        return;
+    }
+
+    let list = Arc::make_mut(&mut pool.active);
+
+    list.retain_mut(|p| {
+        // 1. Ephemeral FX Lifetime Check
+        let life = p.atom.life_5bit();
+        let is_fx = life > 0;
+        if is_fx {
+            if life == 1 {
+                return false; // Expired in mid-air -> despawn
+            }
+            p.atom.set_life_5bit(life - 1);
+        }
+
+        // 2. Gravity & Air Drag
+        // In ChunkWorld, +Y is downward, so gravity increases vel[1].
+        p.vel[1] += PARTICLE_GRAVITY;
+        p.vel[0] *= PARTICLE_AIR_DRAG;
+        p.vel[1] *= PARTICLE_AIR_DRAG;
+
+        let speed_sq = p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1];
+        if speed_sq > MAX_PARTICLE_SPEED * MAX_PARTICLE_SPEED {
+            let speed = speed_sq.sqrt();
+            let scale = MAX_PARTICLE_SPEED / speed;
+            p.vel[0] *= scale;
+            p.vel[1] *= scale;
+        }
+
+        let new_pos = [p.pos[0] + p.vel[0], p.pos[1] + p.vel[1]];
+
+        // 3. Signed Coordinate Conversion (`floor()`)
+        let start = (p.pos[0].floor() as i32, p.pos[1].floor() as i32);
+        let end = (new_pos[0].floor() as i32, new_pos[1].floor() as i32);
+
+        // 4. Bresenham / Integer DDA Line Trace
+        let mut last_free = start;
+        for (cx, cy) in Bresenham::new(start, end) {
+            let Some(atom) = world.get_atom_global(cx, cy) else {
+                // In an unloaded chunk -> drop particle
+                return false;
+            };
+
+            if !atom.is_air() {
+                let (lx, ly) = last_free;
+                if !is_fx {
+                    // Case A: Real Matter -> re-insert into grid
+                    reinsert_particle_atom_with_dirty(
+                        world,
+                        dirty_rects.as_deref_mut(),
+                        lx,
+                        ly,
+                        p.vel,
+                        p.atom,
+                        current_tick,
+                    );
+                    return false;
+                } else if (p.atom.flags & FLAG_PARTICLE_BOUNCE) != 0 {
+                    // Case B: Ephemeral FX with FLAG_PARTICLE_BOUNCE
+                    if cx != lx {
+                        p.vel[0] = -p.vel[0] * 0.55;
+                    }
+                    if cy != ly {
+                        p.vel[1] = -p.vel[1] * 0.55;
+                    }
+                    p.pos = [lx as f32 + 0.5, ly as f32 + 0.5];
+                    return true;
+                } else {
+                    // Case C: Ephemeral FX without bounce
+                    return false;
+                }
+            }
+
+            last_free = (cx, cy);
+        }
+
+        // 5. Unobstructed Move
+        p.pos = new_pos;
+        true
+    });
+}
+
+/// Bones ECS system advancing the [`ParticlePool`] simulation.
+pub fn simulate_particles_system(
+    mut pool: ResMut<ParticlePool>,
+    mut world: ResMut<ChunkWorld>,
+    mut dirty_rects: Option<ResMut<DirtyRects>>,
+) {
+    let current_tick = world.tick;
+    step_particle_simulation(
+        &mut pool,
+        &mut world,
+        dirty_rects.as_deref_mut(),
+        current_tick,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        atom::Materials,
+        chunk::Chunk,
+        plugin::register_sim_schemas,
+    };
+
+    #[test]
+    fn test_particle_data_layout() {
+        assert_eq!(std::mem::size_of::<Particle>(), 24);
+        assert_eq!(std::mem::align_of::<Particle>(), 4);
+
+        let zeroed = Particle::default();
+        let bytes: [u8; 24] = bytemuck::cast(zeroed);
+        assert_eq!(bytes, [0u8; 24]);
+
+        let p = Particle {
+            pos: [12.5, -45.75],
+            vel: [1.25, -2.5],
+            atom: Atom {
+                color: [255, 128, 64, 255],
+                material_id: 2,
+                flags: FLAG_PARTICLE_BOUNCE,
+                vx: -3,
+                vy: 5,
+            },
+        };
+        let cast_bytes: [u8; 24] = bytemuck::cast(p);
+        let back: Particle = bytemuck::cast(cast_bytes);
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn test_life_5bit_roundtrip() {
+        let mut atom = Atom::default();
+        assert_eq!(atom.life_5bit(), 0);
+
+        atom.set_life_5bit(15);
+        assert_eq!(atom.life_5bit(), 15);
+
+        atom.set_life_5bit(31);
+        assert_eq!(atom.life_5bit(), 31);
+
+        // Clamps to 31
+        atom.set_life_5bit(50);
+        assert_eq!(atom.life_5bit(), 31);
+
+        // Ensure bit 2 (FLAG_PARTICLE_BOUNCE) is preserved
+        atom.flags |= FLAG_PARTICLE_BOUNCE;
+        atom.set_life_5bit(7);
+        assert_eq!(atom.life_5bit(), 7);
+        assert_ne!(atom.flags & FLAG_PARTICLE_BOUNCE, 0);
+
+        atom.set_life_5bit(0);
+        assert_eq!(atom.life_5bit(), 0);
+        assert_ne!(atom.flags & FLAG_PARTICLE_BOUNCE, 0);
+    }
+
+    #[test]
+    fn test_bresenham_line() {
+        // Zero length
+        let pts: Vec<_> = Bresenham::new((5, 5), (5, 5)).collect();
+        assert!(pts.is_empty());
+
+        // Horizontal right
+        let pts: Vec<_> = Bresenham::new((0, 0), (3, 0)).collect();
+        assert_eq!(pts, vec![(1, 0), (2, 0), (3, 0)]);
+
+        // Horizontal left
+        let pts: Vec<_> = Bresenham::new((3, 0), (0, 0)).collect();
+        assert_eq!(pts, vec![(2, 0), (1, 0), (0, 0)]);
+
+        // Vertical down
+        let pts: Vec<_> = Bresenham::new((0, 0), (0, 3)).collect();
+        assert_eq!(pts, vec![(0, 1), (0, 2), (0, 3)]);
+
+        // Vertical up
+        let pts: Vec<_> = Bresenham::new((0, 3), (0, 0)).collect();
+        assert_eq!(pts, vec![(0, 2), (0, 1), (0, 0)]);
+
+        // Diagonal
+        let pts: Vec<_> = Bresenham::new((0, 0), (2, 2)).collect();
+        assert_eq!(pts, vec![(1, 1), (2, 2)]);
+    }
+
+    fn setup_test_world() -> (ChunkWorld, DirtyRects, Materials) {
+        let mut world = ChunkWorld::default();
+        let dirty = DirtyRects::default();
+        let materials = Materials::default_builtin();
+
+        for cx in -1..=1 {
+            for cy in -1..=1 {
+                world.add_chunk(ivec2(cx, cy), Chunk::default());
+            }
+        }
+        (world, dirty, materials)
+    }
+
+    #[test]
+    fn test_eject_from_grid() {
+        let (mut world, mut dirty, materials) = setup_test_world();
+        let mut pool = ParticlePool::new();
+
+        // Paint sand at (10, 10)
+        world.paint_at_global(ivec2(10, 10), 2, false, &materials, &mut dirty);
+        assert!(!world.get_atom_global(10, 10).unwrap().is_air());
+
+        // Eject sand into particle pool
+        let ejected = pool.eject_from_grid(&mut world, 10, 10, [2.0, -4.0]);
+        assert!(ejected);
+        assert_eq!(pool.len(), 1);
+
+        // Grid cell is now AIR
+        assert!(world.get_atom_global(10, 10).unwrap().is_air());
+
+        let p = pool.particles()[0];
+        assert_eq!(p.pos, [10.5, 10.5]);
+        assert_eq!(p.vel, [2.0, -4.0]);
+        assert_eq!(p.atom.material_id, 2);
+        assert_eq!(p.atom.life_5bit(), 0);
+
+        // Attempting to eject AIR returns false
+        assert!(!pool.eject_from_grid(&mut world, 10, 10, [0.0, 0.0]));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn test_spawn_fx_and_decay() {
+        let (mut world, mut dirty, _) = setup_test_world();
+        let mut pool = ParticlePool::new();
+
+        pool.spawn_fx([0.0, 0.0], [0.0, 0.0], [255, 0, 0, 255], 3, false);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.particles()[0].atom.life_5bit(), 3);
+
+        // Tick 1: life goes from 3 to 2
+        step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 1);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.particles()[0].atom.life_5bit(), 2);
+
+        // Tick 2: life goes from 2 to 1
+        step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 2);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.particles()[0].atom.life_5bit(), 1);
+
+        // Tick 3: life was 1 -> despawns in mid-air
+        step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 3);
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn test_ephemeral_fx_impact_with_and_without_bounce() {
+        let (mut world, mut dirty, materials) = setup_test_world();
+        let mut pool = ParticlePool::new();
+
+        // Solid rock at y = 10
+        world.paint_at_global(ivec2(5, 10), 8, false, &materials, &mut dirty);
+
+        // 1. Ephemeral FX without bounce hitting solid ground -> despawns
+        pool.spawn_fx([5.5, 8.5], [0.0, 2.0], [255, 255, 255, 255], 20, false);
+        step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 1);
+        assert_eq!(pool.len(), 0);
+
+        // 2. Ephemeral FX WITH bounce hitting solid ground -> bounces
+        pool.spawn_fx([5.5, 8.5], [0.0, 2.0], [255, 255, 255, 255], 20, true);
+        step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 2);
+        assert_eq!(pool.len(), 1);
+        let p = pool.particles()[0];
+        // Snapped to center of last_free cell (y = 9)
+        assert_eq!(p.pos, [5.5, 9.5]);
+        // Bounced velocity in Y is negative
+        assert!(p.vel[1] < 0.0);
+    }
+
+    #[test]
+    fn test_real_matter_reinsertion_and_conservation() {
+        let (mut world, mut dirty, materials) = setup_test_world();
+        let mut pool = ParticlePool::new();
+
+        // Floor of solid rock at y = 20
+        for x in 0..=30 {
+            world.paint_at_global(ivec2(x, 20), 8, false, &materials, &mut dirty);
+        }
+
+        // Spawn a real matter particle (sand, material_id = 2) at (10.5, 18.5) moving downward
+        let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
+        sand_atom.set_life_5bit(0); // 0 = real matter
+        pool.push_particle(Particle {
+            pos: [10.5, 18.5],
+            vel: [0.0, 2.0],
+            atom: sand_atom,
+        });
+
+        step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 1);
+        // Settled into grid, removed from pool
+        assert_eq!(pool.len(), 0);
+
+        // Verify sand placed at (10, 19)
+        let reinserted = world.get_atom_global(10, 19).unwrap();
+        assert_eq!(reinserted.material_id, 2);
+        assert!(reinserted.is_free_falling());
+        assert_eq!(reinserted.vx, 0);
+
+        // Multiple particles landing on the exact same spot:
+        // Spawn 3 sand particles directed at (10.5, 18.5)
+        for _ in 0..3 {
+            pool.push_particle(Particle {
+                pos: [10.5, 18.5],
+                vel: [0.0, 2.0],
+                atom: sand_atom,
+            });
+        }
+        step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 2);
+        assert_eq!(pool.len(), 0);
+
+        // Count sand atoms around x in 8..=12, y in 17..=19
+        let mut sand_count = 0;
+        for x in 8..=12 {
+            for y in 17..=19 {
+                if world.get_atom_global(x, y).is_some_and(|a| a.material_id == 2) {
+                    sand_count += 1;
+                }
+            }
+        }
+        // Total 4 sand atoms (1 initial + 3 new), none lost!
+        assert_eq!(sand_count, 4);
+    }
+
+    #[test]
+    fn test_particles_in_bones_ecs_stage() {
+        register_sim_schemas();
+
+        let mut session = Session::default();
+        session.world.init_resource::<ChunkWorld>();
+        session.world.init_resource::<DirtyRects>();
+        session.world.init_resource::<ParticlePool>();
+
+        // Populate chunks
+        {
+            let mut world = session.world.resource_mut::<ChunkWorld>();
+            for cx in -1..=1 {
+                for cy in -1..=1 {
+                    world.add_chunk(ivec2(cx, cy), Chunk::default());
+                }
+            }
+        }
+
+        // Spawn 2 FX particles
+        {
+            let mut pool = session.world.resource_mut::<ParticlePool>();
+            pool.spawn_fx([0.0, 0.0], [1.0, 1.0], [255, 255, 255, 255], 5, false);
+            pool.spawn_fx([10.0, 10.0], [-1.0, 0.0], [200, 200, 200, 255], 2, false);
+        }
+
+        session.add_system_to_stage(CoreStage::Update, simulate_particles_system);
+
+        // Step 1
+        session.world.run_system(simulate_particles_system, ());
+        {
+            let pool = session.world.resource::<ParticlePool>();
+            assert_eq!(pool.len(), 2);
+            assert_eq!(pool.particles()[0].atom.life_5bit(), 4);
+            assert_eq!(pool.particles()[1].atom.life_5bit(), 1);
+        }
+
+        // Step 2: second particle expires (life was 1)
+        session.world.run_system(simulate_particles_system, ());
+        {
+            let pool = session.world.resource::<ParticlePool>();
+            assert_eq!(pool.len(), 1);
+            assert_eq!(pool.particles()[0].atom.life_5bit(), 3);
+        }
+    }
+}

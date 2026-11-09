@@ -92,6 +92,7 @@ pub struct ChunkRenderState {
 pub fn register_render_schemas() {
     ChunkSprite::register_schema();
     ChunkRenderState::register_schema();
+    crate::particles::register_particle_render_schemas();
 }
 
 /// Bones plugin that synchronizes `ChunkWorld` chunks and dirty rects to `Sprite` textures.
@@ -108,7 +109,10 @@ impl SessionPlugin for AstratomicRenderPlugin {
     fn install(self, session: &mut Session) {
         register_render_schemas();
         session.world.init_resource::<ChunkRenderState>();
+        session.world.init_resource::<crate::particles::ParticleRenderState>();
+        session.world.init_resource::<crate::particles::ParticleRenderConfig>();
         session.add_system_to_stage(CoreStage::PostUpdate, sync_chunk_sprites_system);
+        session.add_system_to_stage(CoreStage::PostUpdate, crate::particles::render_particles_system);
     }
 }
 

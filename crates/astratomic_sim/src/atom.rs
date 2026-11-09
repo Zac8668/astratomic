@@ -81,6 +81,8 @@ pub struct Material {
     pub damage: f32,
     #[serde(default)]
     pub default_state: AtomState,
+    #[serde(default)]
+    pub weight: f32,
 }
 
 /// Custom [`bones_asset::AssetLoader`] for loading [`Materials`] from `.ron` / `atoms.ron` asset files.
@@ -126,17 +128,20 @@ impl Materials {
             // 0: Void
             Material {
                 default_state: AtomState::Void,
+                weight: 0.0,
                 ..Default::default()
             },
             // 1: Object
             Material {
                 default_state: AtomState::Object,
+                weight: 10.0,
                 ..Default::default()
             },
             // 2: Sand
             Material {
                 inertial_resistance: 0.1,
                 default_state: AtomState::Powder,
+                weight: 1.5,
                 ..Default::default()
             },
             // 3: Water
@@ -144,12 +149,14 @@ impl Materials {
                 flow: 5,
                 damage: 0.0,
                 default_state: AtomState::Liquid,
+                weight: 1.0,
                 ..Default::default()
             },
             // 4: Gravel
             Material {
                 inertial_resistance: 0.60,
                 default_state: AtomState::Powder,
+                weight: 2.0,
                 ..Default::default()
             },
             // 5: Lava
@@ -157,21 +164,25 @@ impl Materials {
                 flow: 1,
                 damage: 15.0,
                 default_state: AtomState::Liquid,
+                weight: 2.5,
                 ..Default::default()
             },
             // 6: Grass
             Material {
                 default_state: AtomState::Solid,
+                weight: 1.0,
                 ..Default::default()
             },
             // 7: Dirt
             Material {
                 default_state: AtomState::Solid,
+                weight: 1.3,
                 ..Default::default()
             },
             // 8: Rock
             Material {
                 default_state: AtomState::Solid,
+                weight: 2.5,
                 ..Default::default()
             },
             // 9: Acid
@@ -179,36 +190,43 @@ impl Materials {
                 flow: 5,
                 damage: 3.0,
                 default_state: AtomState::Liquid,
+                weight: 1.1,
                 ..Default::default()
             },
             // 10: Compacted Dirt
             Material {
                 default_state: AtomState::Solid,
+                weight: 1.6,
                 ..Default::default()
             },
             // 11: Leaves
             Material {
                 default_state: AtomState::Solid,
+                weight: 0.3,
                 ..Default::default()
             },
             // 12: Wood
             Material {
                 default_state: AtomState::Solid,
+                weight: 0.7,
                 ..Default::default()
             },
             // 13: Coal
             Material {
                 default_state: AtomState::Solid,
+                weight: 1.3,
                 ..Default::default()
             },
             // 14: Iron Ore
             Material {
                 default_state: AtomState::Solid,
+                weight: 5.0,
                 ..Default::default()
             },
             // 15: Gold Ore
             Material {
                 default_state: AtomState::Solid,
+                weight: 10.0,
                 ..Default::default()
             },
         ])
@@ -244,6 +262,9 @@ impl Atom {
     /// Bits 6..8 of `flags` store `updated_at` parity (`dt & 0b11`).
     pub const UPDATED_AT_SHIFT: u8 = 6;
     pub const UPDATED_AT_MASK: u8 = 0b1100_0000;
+    /// Bits 3..=7 of `flags` store 5-bit particle lifetime (0 = real matter, >0 = ephemeral FX).
+    pub const LIFE_5BIT_SHIFT: u8 = 3;
+    pub const LIFE_5BIT_MASK: u8 = 0b1111_1000;
 
     pub const VOID: Self = Self {
         color: [0, 0, 0, 0],
@@ -252,6 +273,7 @@ impl Atom {
         vx: 0,
         vy: 0,
     };
+    pub const AIR: Self = Self::VOID;
 
     #[inline]
     pub const fn object() -> Self {
@@ -540,6 +562,27 @@ impl Atom {
     #[inline]
     pub const fn is_void(&self) -> bool {
         self.material_id == 0
+    }
+
+    #[inline]
+    pub const fn is_air(&self) -> bool {
+        self.is_void()
+    }
+
+    #[inline]
+    pub const fn life_5bit(&self) -> u8 {
+        (self.flags & Self::LIFE_5BIT_MASK) >> Self::LIFE_5BIT_SHIFT
+    }
+
+    #[inline]
+    pub fn set_life_5bit(&mut self, life: u8) {
+        let clamped = life.min(31);
+        self.flags = (self.flags & !Self::LIFE_5BIT_MASK) | (clamped << Self::LIFE_5BIT_SHIFT);
+    }
+
+    #[inline]
+    pub fn mark_updated(&mut self, current_tick: u64) {
+        self.set_updated_at((current_tick & 0b11) as u8);
     }
 
     #[inline]
