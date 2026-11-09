@@ -31,8 +31,14 @@ winit = "0.30"
 # Physics & geometry
 rapier2d = { version = "0.22", features = ["parallel", "enhanced-determinism"] }
 
+# Storage, compression, & concurrency
+redb = "4.5"
+zstd = "0.14"
+crossbeam-channel = "0.5.17"
+bitcode = "0.6"
+
 # Math, serialization, & utilities
-bytemuck = { version = "1.21", features = ["derive"] }
+bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 glam = "0.24" # Matches bones_framework 0.4
 serde = { version = "1.0", features = ["derive"] }
 ron = "0.8"

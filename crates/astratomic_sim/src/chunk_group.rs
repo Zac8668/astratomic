@@ -248,6 +248,26 @@ pub fn update_chunk_groups<'a>(
     let (dirty_update_rect_send, dirty_render_rect_send) = senders;
     let (dt, materials) = update;
 
+    // Ensure Copy-on-Write (`Arc::make_mut`) is performed before parallel tasks take raw pointers
+    // into any shared `Arc<ChunkGrid>` instances.
+    let active_centers: Vec<IVec2> = dirty_rects
+        .keys()
+        .copied()
+        .filter(|chunk_pos| {
+            let same_x = (chunk_pos.x + x_toff + manager_pos.x.abs() % 2) % 2 == 0;
+            let same_y = (chunk_pos.y + y_toff + manager_pos.y.abs() % 2) % 2 == 0;
+            same_x && same_y && chunks.contains_key(chunk_pos)
+        })
+        .collect();
+
+    for center_pos in &active_centers {
+        for (x_off, y_off) in (-1..=1).cartesian_product(-1..=1) {
+            if let Some(chunk) = chunks.get_mut(&(*center_pos + ivec2(x_off, y_off))) {
+                let _ = std::sync::Arc::make_mut(&mut chunk.grid);
+            }
+        }
+    }
+
     for chunk_pos in dirty_rects.keys() {
         //Get chunks mutable reference from it's pointer
         let chunks_ptr: *mut HashMap<IVec2, Chunk> = chunks;
@@ -266,7 +286,10 @@ pub fn update_chunk_groups<'a>(
             }
 
             //Get center and create group
-            let first = chunks.get_mut(chunk_pos).unwrap().atoms.as_mut_ptr();
+            let center_chunk = chunks.get_mut(chunk_pos).unwrap();
+            let first = std::sync::Arc::make_mut(&mut center_chunk.grid)
+                .atoms
+                .as_mut_ptr();
             let center;
             unsafe {
                 center = slice::from_raw_parts_mut(first, CHUNK_LEN);
@@ -290,7 +313,8 @@ pub fn update_chunk_groups<'a>(
                             continue;
                         };
 
-                        let mut start_ptr = chunk.atoms.as_mut_ptr();
+                        let mut start_ptr =
+                            std::sync::Arc::make_mut(&mut chunk.grid).atoms.as_mut_ptr();
                         if y_off == -1 {
                             unsafe {
                                 start_ptr = start_ptr.add(HALF_CHUNK_LEN);
@@ -313,7 +337,8 @@ pub fn update_chunk_groups<'a>(
                             continue;
                         };
 
-                        let start_ptr = chunk.atoms.as_mut_ptr();
+                        let start_ptr =
+                            std::sync::Arc::make_mut(&mut chunk.grid).atoms.as_mut_ptr();
 
                         let mut atoms = vec![];
                         let mut add_off = match x_off {
@@ -341,7 +366,8 @@ pub fn update_chunk_groups<'a>(
                             continue;
                         };
 
-                        let start_ptr = chunk.atoms.as_mut_ptr();
+                        let start_ptr =
+                            std::sync::Arc::make_mut(&mut chunk.grid).atoms.as_mut_ptr();
 
                         let mut atoms = vec![];
                         let mut add_off = match (x_off, y_off) {

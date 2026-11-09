@@ -1,5 +1,6 @@
 //! Bones game sessions and lifecycle management.
 
+use astratomic_sim::prelude::AstratomicSimPlugin;
 use bones_framework::prelude::*;
 
 use crate::meta::GameMeta;
@@ -39,6 +40,7 @@ impl GamePlugin for AstratomicGamePlugin {
 pub fn world_session_plugin(session: &mut Session) {
     session
         .install_plugin(DefaultSessionPlugin)
+        .install_plugin(AstratomicSimPlugin)
         .add_system_to_stage(CoreStage::Startup, setup_world);
 }
 

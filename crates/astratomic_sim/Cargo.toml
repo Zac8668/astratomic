@@ -16,6 +16,10 @@ bones_asset.workspace = true
 bones_schema.workspace = true
 
 rapier2d.workspace = true
+redb.workspace = true
+zstd.workspace = true
+crossbeam-channel.workspace = true
+bitcode.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 serde.workspace = true
@@ -23,8 +27,6 @@ ron.workspace = true
 thiserror.workspace = true
 
 serde_derive = "1.0"
-bincode = "1.3"
-serde-big-array = "0.5"
 noise = "0.9.0"
 contour = "0.13"
 geo = "0.29"

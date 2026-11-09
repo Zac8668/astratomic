@@ -1,8 +1,11 @@
 // Chunk length MUST be divisible by 4
-pub const CHUNK_LENGHT: usize = 64;
-pub const HALF_CHUNK_LENGHT: usize = CHUNK_LENGHT / 2;
+pub const CHUNK_SIZE: usize = 64;
+pub const HALF_CHUNK_SIZE: usize = CHUNK_SIZE / 2;
 
-pub const CHUNK_LEN: usize = CHUNK_LENGHT * CHUNK_LENGHT;
+pub const CHUNK_LENGHT: usize = CHUNK_SIZE;
+pub const HALF_CHUNK_LENGHT: usize = CHUNK_SIZE / 2;
+
+pub const CHUNK_LEN: usize = CHUNK_SIZE * CHUNK_SIZE;
 pub const HALF_CHUNK_LEN: usize = CHUNK_LEN / 2;
 pub const QUARTER_CHUNK_LEN: usize = CHUNK_LEN / 4;
 
