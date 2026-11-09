@@ -38,7 +38,7 @@ pub const BTN_INTERACT: u8 = 1 << 4;
 pub const MAX_PLAYERS: usize = 4;
 
 /// Default half-extents of a player's hitbox in atoms (`6x12` atom AABB).
-pub const PLAYER_HALF_SIZE: Vec2 = Vec2::new(3.0, 6.0);
+pub const PLAYER_HALF_SIZE: Vec2 = Vec2::new(4.0, 9.0);
 
 /// Downward gravity acceleration per tick in Bones world space (`+Y` up, `-Y` down).
 pub const PLAYER_GRAVITY_ACCEL: f32 = 0.36;
