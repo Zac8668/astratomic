@@ -1,0 +1,32 @@
+[package]
+name = "astratomic_game"
+description = "Astratomic 2D survival game built on Bones"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+default-run = "astratomic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "astratomic"
+path = "src/main.rs"
+
+[dependencies]
+astratomic_sim.workspace = true
+astratomic_physics.workspace = true
+astratomic_render.workspace = true
+
+bones_framework.workspace = true
+bones_lib.workspace = true
+bones_ecs.workspace = true
+bones_asset.workspace = true
+bones_schema.workspace = true
+bones_wgpu_renderer.workspace = true
+
+glam.workspace = true
+serde.workspace = true
+ron.workspace = true
+thiserror.workspace = true

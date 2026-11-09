@@ -1,0 +1,2 @@
+# Core asset pack entry point for Bones AssetServer.
+root: ./game.yaml

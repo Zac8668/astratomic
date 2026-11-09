@@ -1,0 +1,2 @@
+# Root metadata asset corresponding to `astratomic_game::meta::GameMeta`.
+player_atlas: ./player/player_sheet.atlas.yaml

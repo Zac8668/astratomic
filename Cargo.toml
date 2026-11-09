@@ -1,55 +1,59 @@
-[package]
-name = "astratomic"
-description = "A 2D survival game"
-version     = "0.2.0"
-edition     = "2021"
-license     = "PolyForm NonCommercial v1.0"
-default-run = "astratomic"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/astratomic_game"]
 
-[dependencies]
-bevy                = {version = "0.15.3", features =["file_watcher"]}
-bevy-inspector-egui = "0.28.1"
-rand                = { version = "0.9", features = ["small_rng"] }
-fastrand            = "2.0"
-async-channel       = "2.1"
-smallvec            = "1.12"
-itertools           = "0.14"
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.93"
+repository = "https://github.com/spicylobstergames/astratomic"
+authors = ["Isaac Turci", "The Spicy Lobster Team"]
 
-serde               = "1.0"
-serde_derive        = "1.0"
-bincode             = "1.3"
-serde-big-array     = "0.5"
-ron                 = "0.8"
-bevy_async_task = "0.4.0"
+[workspace.dependencies]
+# Internal workspace crates
+astratomic_sim = { path = "crates/astratomic_sim" }
+astratomic_physics = { path = "crates/astratomic_physics" }
+astratomic_render = { path = "crates/astratomic_render" }
 
-sled = "0.34"
-zstd = "0.13"
+# Bones engine
+bones_framework = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
+bones_lib = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
+bones_ecs = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
+bones_asset = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
+bones_schema = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
+bones_wgpu_renderer = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
 
-contour = "0.13"
-bevy_rapier2d = { version = "0.28", features = [ "simd-stable", "debug-render-2d", "parallel" ] }
-geo = "0.29"
+# Rendering & windowing
+wgpu = "24"
+winit = "0.30"
 
-puffin              = "0.19"
+# Physics & geometry
+rapier2d = { version = "0.22", features = ["parallel", "enhanced-determinism"] }
 
+# Math, serialization, & utilities
+bytemuck = { version = "1.21", features = ["derive"] }
+glam = "0.24" # Matches bones_framework 0.4
+serde = { version = "1.0", features = ["derive"] }
+ron = "0.8"
 thiserror = "2.0"
-noise = "0.9.0"
 
 # Optimize dependencies even in development
 [profile.dev.package."*"]
 codegen-units = 1
-debug         = 1 # Only keep line numbers
-opt-level     = 3
+debug = 1
+opt-level = 3
 
-# Optimize our code a little bit.
+# Optimize workspace crates slightly in development
 [profile.dev]
 codegen-units = 256
-opt-level     = 1
+opt-level = 1
 
 [profile.dev-optimized]
-debug     = 1
-inherits  = "dev"
+inherits = "dev"
+debug = 1
 opt-level = 3
 
 [profile.release]
-codegen-units = 1    # Improved rapier physics perf, so it might help other stuff, too
-lto           = true
+codegen-units = 1
+lto = true

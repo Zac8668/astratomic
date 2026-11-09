@@ -1,0 +1,23 @@
+[package]
+name = "astratomic_physics"
+description = "KinematicActor controller and pixel-backed rigidbodies over astratomic_sim"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+astratomic_sim.workspace = true
+
+bones_framework.workspace = true
+bones_lib.workspace = true
+bones_ecs.workspace = true
+bones_asset.workspace = true
+bones_schema.workspace = true
+
+bytemuck.workspace = true
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
