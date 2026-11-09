@@ -1,7 +1,9 @@
-//! Egui world debug panel, material brush, prefab stamper, camera controls, and debug overlays.
+//! Egui world debug panel, player/actor inspector, material brush, prefab stamper, camera controls,
+//! and wireframe debug overlays.
 
 use std::collections::HashSet;
 
+use astratomic_physics::prelude::{ActorState, KinematicActor, find_surface_spawn_pos};
 use astratomic_sim::{
     atom::{Atom, Materials},
     chunk::CHUNK_SIZE,
@@ -15,6 +17,8 @@ use astratomic_sim::{
 };
 use bones_framework::prelude::*;
 
+use crate::player::{LocalInputState, LocalView, MatchInputs, PlayerControlled};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, HasSchema)]
 #[repr(u8)]
 pub enum BrushShape {
@@ -27,8 +31,9 @@ pub enum BrushShape {
 #[repr(u8)]
 pub enum DebugToolMode {
     #[default]
-    Brush = 0,
-    PrefabStamp = 1,
+    PlayerTool = 0,
+    Brush = 1,
+    PrefabStamp = 2,
 }
 
 /// Session resource holding the state of the world debug UI, camera, and brush tools.
@@ -46,9 +51,11 @@ pub struct DebugToolState {
     pub show_dirty_rects: bool,
     pub show_chunk_grid: bool,
     pub show_brush_cursor: bool,
+    pub show_actor_debug: bool,
     pub camera_height: f32,
     pub camera_speed: f32,
     pub reset_camera_requested: bool,
+    pub respawn_player_requested: bool,
     pub gen_scale: f64,
     pub gen_seed: u32,
     pub gen_params_initialized: bool,
@@ -62,12 +69,13 @@ pub struct DebugToolState {
     pub dirty_rect_path_entity: Option<Entity>,
     pub chunk_grid_path_entity: Option<Entity>,
     pub brush_cursor_path_entity: Option<Entity>,
+    pub actor_debug_path_entity: Option<Entity>,
 }
 
 impl Default for DebugToolState {
     fn default() -> Self {
         Self {
-            tool_mode: DebugToolMode::Brush,
+            tool_mode: DebugToolMode::PlayerTool,
             selected_material_id: 2, // Sand
             brush_radius: 4,
             brush_shape: BrushShape::Circle,
@@ -78,9 +86,11 @@ impl Default for DebugToolState {
             show_dirty_rects: false,
             show_chunk_grid: false,
             show_brush_cursor: true,
-            camera_height: 420.0,
+            show_actor_debug: true,
+            camera_height: 240.0,
             camera_speed: 320.0,
             reset_camera_requested: false,
+            respawn_player_requested: false,
             gen_scale: 512.0,
             gen_seed: 8668,
             gen_params_initialized: false,
@@ -94,6 +104,7 @@ impl Default for DebugToolState {
             dirty_rect_path_entity: None,
             chunk_grid_path_entity: None,
             brush_cursor_path_entity: None,
+            actor_debug_path_entity: None,
         }
     }
 }
@@ -127,10 +138,15 @@ pub fn track_input_state_system(
     keyboard: Option<Res<KeyboardInputs>>,
     mouse: Option<Res<MouseInputs>>,
     window: Option<Res<Window>>,
+    mut local_input: Option<ResMut<LocalInputState>>,
     mut state: ResMut<DebugToolState>,
 ) {
     state.just_pressed_keys.clear();
     state.just_pressed_mouse.clear();
+
+    if let Some(ref mut li) = local_input {
+        li.mouse_actions_enabled = matches!(state.tool_mode, DebugToolMode::PlayerTool);
+    }
 
     if let Some(window) = window
         && !window.focused
@@ -169,14 +185,20 @@ pub fn track_input_state_system(
     }
 }
 
-/// Controls the 2D camera pan (WASD / Arrow keys / Middle-Mouse drag) and zoom (scroll wheel),
-/// and updates `SimulationSettings::focus_world_pos` for chunk streaming.
+/// Controls camera zoom (scroll wheel), free-fly camera pan when detached from player,
+/// and player respawning at the terrain surface.
 pub fn camera_control_system(
     time: Res<Time>,
     mouse: Option<Res<MouseInputs>>,
     mouse_world: Option<Res<MouseWorldPosition>>,
     egui_ctx: Option<Res<EguiCtx>>,
+    chunk_world: Res<ChunkWorld>,
     entities: Res<Entities>,
+    player_controlled: Comp<PlayerControlled>,
+    mut actors: CompMut<KinematicActor>,
+    mut actor_states: CompMut<ActorState>,
+    mut local_view: ResMut<LocalView>,
+    mut local_input: Option<ResMut<LocalInputState>>,
     mut cameras: CompMut<Camera>,
     mut transforms: CompMut<Transform>,
     mut sim_settings: ResMut<SimulationSettings>,
@@ -194,7 +216,7 @@ pub fn camera_control_system(
 
     // Quick hotkeys when egui is not capturing keyboard focus.
     if !egui_wants_kb {
-        if state.just_pressed_keys.contains(&KeyCode::Space) {
+        if state.just_pressed_keys.contains(&KeyCode::P) {
             sim_settings.paused = !sim_settings.paused;
         }
         let hotkey_materials = [
@@ -212,7 +234,27 @@ pub fn camera_control_system(
         for (key, mat_id) in hotkey_materials {
             if state.just_pressed_keys.contains(&key) {
                 state.selected_material_id = mat_id;
-                state.tool_mode = DebugToolMode::Brush;
+            }
+        }
+    }
+
+    // Handle respawn player request
+    if state.respawn_player_requested {
+        state.respawn_player_requested = false;
+        for (ent, ctrl) in entities.iter_with(&player_controlled) {
+            if ctrl.player_id == local_view.local_player_id
+                && let Some(actor) = actors.get_mut(ent)
+            {
+                let spawn_pos =
+                    find_surface_spawn_pos(&chunk_world, actor.pos.x, actor.half_size);
+                actor.pos = spawn_pos;
+                actor.prev_pos = spawn_pos;
+                actor.vel = Vec2::ZERO;
+                actor.grounded = true;
+                if let Some(st) = actor_states.get_mut(ent) {
+                    *st = ActorState::default();
+                }
+                local_view.camera_pos = spawn_pos;
             }
         }
     }
@@ -227,8 +269,12 @@ pub fn camera_control_system(
         }
     }
 
+    let follow_player = local_input
+        .as_ref()
+        .is_none_or(|li| li.camera_follow_player);
+
     let mut pan_dir = Vec2::ZERO;
-    if !egui_wants_kb {
+    if !follow_player && !egui_wants_kb {
         if state.held_keys.contains(&KeyCode::A) || state.held_keys.contains(&KeyCode::Left) {
             pan_dir.x -= 1.0;
         }
@@ -257,16 +303,25 @@ pub fn camera_control_system(
 
     for (_ent, (camera, transform)) in entities.iter_with((&mut cameras, &mut transforms)) {
         if state.reset_camera_requested {
-            transform.translation.x = 0.0;
-            transform.translation.y = 200.0;
+            transform.translation.x = local_view.camera_pos.x;
+            transform.translation.y = local_view.camera_pos.y;
+            if let Some(ref mut li) = local_input {
+                li.camera_follow_player = true;
+            }
             state.reset_camera_requested = false;
         }
         camera.size = CameraSize::FixedHeight(state.camera_height);
-        transform.translation.x += velocity.x * dt;
-        transform.translation.y += velocity.y * dt;
 
-        // Middle-mouse drag camera panning
+        if !follow_player {
+            transform.translation.x += velocity.x * dt;
+            transform.translation.y += velocity.y * dt;
+        }
+
+        // Middle-mouse drag camera panning detaches camera follow automatically
         if !egui_wants_pointer && state.held_mouse.contains(&MouseButton::Middle) {
+            if let Some(ref mut li) = local_input {
+                li.camera_follow_player = false;
+            }
             if let Some(curr_world) = current_mouse_world {
                 if let Some(prev_world) = state.prev_middle_drag_world {
                     let delta = prev_world - curr_world;
@@ -280,7 +335,9 @@ pub fn camera_control_system(
             state.prev_middle_drag_world = None;
         }
 
-        sim_settings.focus_world_pos = transform.translation.truncate();
+        if !follow_player {
+            sim_settings.focus_world_pos = transform.translation.truncate();
+        }
     }
 }
 
@@ -315,6 +372,10 @@ pub fn world_debug_tool_system(
     let left_just_pressed = state.just_pressed_mouse.contains(&MouseButton::Left);
 
     match state.tool_mode {
+        DebugToolMode::PlayerTool => {
+            // Handled deterministically in `player_world_action_system` via `MatchInputs`.
+            state.prev_cursor_global = None;
+        }
         DebugToolMode::Brush => {
             if left_down || right_down {
                 let mat_id = if right_down {
@@ -403,12 +464,17 @@ fn ensure_overlay_entity(
     ent
 }
 
-/// Renders wireframe debug overlays (dirty rects, chunk grid borders, and brush cursor) using `Path2d`.
+/// Renders wireframe debug overlays (dirty rects, chunk grid borders, brush cursor, and
+/// `KinematicActor` hitbox / step-height / aim / ground normal) using `Path2d`.
 pub fn debug_overlays_system(
     mouse_world: Option<Res<MouseWorldPosition>>,
     egui_ctx: Option<Res<EguiCtx>>,
     chunk_world: Res<ChunkWorld>,
     dirty_rects: Res<DirtyRects>,
+    match_inputs: Res<MatchInputs>,
+    local_view: Res<LocalView>,
+    player_controlled: Comp<PlayerControlled>,
+    actors: Comp<KinematicActor>,
     mut entities: ResMut<Entities>,
     mut transforms: CompMut<Transform>,
     mut paths: CompMut<Path2d>,
@@ -500,6 +566,7 @@ pub fn debug_overlays_system(
 
         if state.show_brush_cursor
             && !egui_wants_pointer
+            && !matches!(state.tool_mode, DebugToolMode::PlayerTool)
             && let Some(cursor_world) = mouse_world.and_then(|mw| mw.0)
         {
             let global = world_to_global_atom(cursor_world);
@@ -531,13 +598,69 @@ pub fn debug_overlays_system(
             }
         }
     }
+
+    // 4. KinematicActor hitbox, step-height line, ground normal, and aim direction overlay
+    let actor_ent = ensure_overlay_entity(
+        &mut state.actor_debug_path_entity,
+        &mut entities,
+        &mut transforms,
+        &mut paths,
+        12.0,
+    );
+    if let Some(path) = paths.get_mut(actor_ent) {
+        path.points.clear();
+        path.line_breaks.clear();
+        path.color = Color::rgba(0.25, 0.95, 1.0, 0.9);
+        path.thickness = 1.0;
+
+        if state.show_actor_debug {
+            let alpha = local_view.render_alpha.clamp(0.0, 1.0);
+            for (ent, actor) in entities.iter_with(&actors) {
+                let p = actor.prev_pos.lerp(actor.pos, alpha);
+                let tl = Vec2::new(p.x - actor.half_size.x, p.y + actor.half_size.y);
+                let br = Vec2::new(p.x + actor.half_size.x, p.y - actor.half_size.y);
+                append_rect_path(&mut path.points, &mut path.line_breaks, tl, br);
+
+                // Foot step-height line
+                let step_y = (p.y - actor.half_size.y) + actor.step_height as f32;
+                path.points.push(Vec2::new(tl.x, step_y));
+                path.points.push(Vec2::new(br.x, step_y));
+                path.line_breaks.push(path.points.len());
+
+                // Ground normal vector from feet center
+                let foot_center = Vec2::new(p.x, p.y - actor.half_size.y);
+                path.points.push(foot_center);
+                path.points.push(foot_center + actor.ground_normal * 6.0);
+                path.line_breaks.push(path.points.len());
+
+                // Aim vector if player-controlled
+                if let Some(ctrl) = player_controlled.get(ent)
+                    && let Some(input) = match_inputs.players.get(ctrl.player_id as usize)
+                {
+                    let aim = input.aim_vec2();
+                    if aim != Vec2::ZERO {
+                        path.points.push(p);
+                        path.points.push(p + aim * 12.0);
+                        path.line_breaks.push(path.points.len());
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// Renders the interactive `egui` World Debug Window.
+/// Renders the interactive `egui` World & Player Debug Window.
 pub fn debug_ui_system(
     egui_ctx: Option<Res<EguiCtx>>,
     mouse_world: Option<Res<MouseWorldPosition>>,
     materials: Res<Materials>,
+    entities: Res<Entities>,
+    player_controlled: Comp<PlayerControlled>,
+    actors: Comp<KinematicActor>,
+    actor_states: Comp<ActorState>,
+    match_inputs: Res<MatchInputs>,
+    local_view: Res<LocalView>,
+    mut local_input: Option<ResMut<LocalInputState>>,
     mut generator: ResMut<Generator>,
     mut sim_settings: ResMut<SimulationSettings>,
     mut chunk_world: ResMut<ChunkWorld>,
@@ -568,7 +691,7 @@ pub fn debug_ui_system(
 
     egui::Window::new("Astratomic World Debug")
         .default_pos(egui::pos2(12.0, 12.0))
-        .default_width(310.0)
+        .default_width(325.0)
         .resizable(true)
         .show(&ctx, |ui| {
             // --- Telemetry & Cursor Inspector ---
@@ -593,10 +716,57 @@ pub fn debug_ui_system(
                 "Window Origin: ({}, {}) | Camera: ({:.0}, {:.0}) | I/O Queue: {}",
                 chunk_world.pos.x,
                 chunk_world.pos.y,
-                sim_settings.focus_world_pos.x,
-                sim_settings.focus_world_pos.y,
+                local_view.camera_pos.x,
+                local_view.camera_pos.y,
                 io_worker.pending_loads.len()
             ));
+
+            ui.separator();
+
+            // --- Player & KinematicActor Telemetry ---
+            ui.heading("Player & KinematicActor");
+            let mut found_player = false;
+            for (ent, (ctrl, actor)) in entities.iter_with((&player_controlled, &actors)) {
+                if ctrl.player_id == local_view.local_player_id {
+                    found_player = true;
+                    let input = match_inputs.players[ctrl.player_id as usize];
+                    let st = actor_states.get(ent).copied().unwrap_or_default();
+                    ui.small(format!(
+                        "Player #{} | pos=({:.2}, {:.2}) | vel=({:.2}, {:.2})",
+                        ctrl.player_id, actor.pos.x, actor.pos.y, actor.vel.x, actor.vel.y
+                    ));
+                    ui.small(format!(
+                        "grounded={} | coyote={}t | normal=({:.2}, {:.2}) | buried={}t",
+                        actor.grounded,
+                        st.coyote_ticks,
+                        actor.ground_normal.x,
+                        actor.ground_normal.y,
+                        st.buried_ticks
+                    ));
+                    ui.small(format!(
+                        "fuel={:.1}/{:.0} | slot={} | aim=({:.2}, {:.2}) | cd={}t",
+                        st.jetpack_fuel,
+                        st.max_jetpack_fuel,
+                        input.selected_slot,
+                        input.aim_dir[0],
+                        input.aim_dir[1],
+                        st.fire_cooldown_ticks
+                    ));
+                    break;
+                }
+            }
+            if !found_player {
+                ui.small("No local player entity found.");
+            }
+
+            ui.horizontal(|ui| {
+                if let Some(ref mut li) = local_input {
+                    ui.checkbox(&mut li.camera_follow_player, "Camera Follow Player");
+                }
+                if ui.small_button("Respawn at Surface").clicked() {
+                    state.respawn_player_requested = true;
+                }
+            });
 
             ui.separator();
 
@@ -644,9 +814,9 @@ pub fn debug_ui_system(
             ui.heading("Simulation & Camera");
             ui.horizontal(|ui| {
                 let pause_label = if sim_settings.paused {
-                    "▶ Resume (Space)"
+                    "▶ Resume (P)"
                 } else {
-                    "⏸ Pause (Space)"
+                    "⏸ Pause (P)"
                 };
                 if ui.button(pause_label).clicked() {
                     sim_settings.paused = !sim_settings.paused;
@@ -677,22 +847,29 @@ pub fn debug_ui_system(
                 ui.label("Presets:");
                 for (label, h) in [
                     ("Close (180)", 180.0),
-                    ("Normal (420)", 420.0),
-                    ("Wide (800)", 800.0),
-                    ("Full Window (1200)", 1200.0),
+                    ("Normal (240)", 240.0),
+                    ("Wide (420)", 420.0),
+                    ("Full (800)", 800.0),
                 ] {
                     if ui.small_button(label).clicked() {
                         state.camera_height = h;
                     }
                 }
             });
-            ui.small("Pan: WASD / Arrows (Shift = Fast) or Middle-Mouse Drag | Zoom: Scroll Wheel");
+            ui.small(
+                "Move: A/D | Jump: Space/W | Jetpack: Shift/Space (air) | Zoom: Scroll | Free Pan: Middle-Drag",
+            );
 
             ui.separator();
 
             // --- World Interaction Tool ---
             ui.heading("World Tool");
             ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut state.tool_mode,
+                    DebugToolMode::PlayerTool,
+                    "⛏ Player Tool",
+                );
                 ui.selectable_value(
                     &mut state.tool_mode,
                     DebugToolMode::Brush,
@@ -706,6 +883,11 @@ pub fn debug_ui_system(
             });
 
             match state.tool_mode {
+                DebugToolMode::PlayerTool => {
+                    ui.small(
+                        "Left-Click: Excavate along Aim | Right-Click: Emit Material (Keys 0-9)",
+                    );
+                }
                 DebugToolMode::Brush => {
                     ui.small("Left-Click: Paint Material | Right-Click: Erase (Void) | Keys 0-9");
                     ui.horizontal(|ui| {
@@ -785,6 +967,7 @@ pub fn debug_ui_system(
             // --- Debug Overlays ---
             ui.heading("Debug Overlays");
             ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut state.show_actor_debug, "Actor Hitbox & Aim");
                 ui.checkbox(&mut state.show_dirty_rects, "Dirty Rects");
                 ui.checkbox(&mut state.show_chunk_grid, "Chunk Grid");
                 ui.checkbox(&mut state.show_brush_cursor, "Brush Cursor");
@@ -798,7 +981,7 @@ pub fn debug_ui_system(
                 if ui.button("💾 Save All Chunks (redb)").clicked() {
                     chunk_world.save_all_chunks(&io_worker);
                 }
-                if ui.button("🎯 Reset Camera to Surface").clicked() {
+                if ui.button("🎯 Snap Camera to Player").clicked() {
                     state.reset_camera_requested = true;
                 }
             });

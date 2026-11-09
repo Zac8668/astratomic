@@ -2,4 +2,6 @@ pub mod actor;
 pub mod plugin;
 pub mod rigidbody;
 
-pub mod prelude {}
+pub mod prelude {
+    pub use crate::{actor::*, plugin::*};
+}

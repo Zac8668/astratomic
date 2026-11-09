@@ -303,6 +303,7 @@ dependencies = [
 name = "astratomic_game"
 version = "0.3.0"
 dependencies = [
+ "astratomic_physics",
  "astratomic_render",
  "astratomic_sim",
  "bones_asset",
@@ -311,6 +312,7 @@ dependencies = [
  "bones_lib",
  "bones_schema",
  "bones_wgpu_renderer",
+ "bytemuck",
  "fastrand 2.5.0",
  "glam 0.24.2",
  "ron",
@@ -322,6 +324,7 @@ dependencies = [
 name = "astratomic_physics"
 version = "0.3.0"
 dependencies = [
+ "astratomic_sim",
  "bones_asset",
  "bones_ecs",
  "bones_framework",
