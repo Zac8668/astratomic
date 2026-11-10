@@ -15,9 +15,7 @@ use astratomic_sim::{
         TOOL_DISTANCE, TOOL_RANGE,
     },
     geom_tools::Line,
-    particle::{
-        PARTICLE_IGNORE_WORLD_COLLISION, Particle, ParticleActorTargets, ParticlePool,
-    },
+    particle::{PARTICLE_IGNORE_WORLD_COLLISION, Particle, ParticleActorTargets, ParticlePool},
     world::{
         ChunkWorld, DirtyRects, SimulationSettings, global_to_chunk, update_dirty_rects,
         update_dirty_rects_3x3,
@@ -212,6 +210,7 @@ impl SessionPlugin for AstratomicPlayerPlugin {
             .add_system_to_stage(CoreStage::PreUpdate, stamp_actor_objects_system)
             .add_system_to_stage(CoreStage::Update, clear_actor_objects_system)
             .add_system_to_stage(CoreStage::PostUpdate, update_local_view_camera_system)
+            .add_system_to_stage(CoreStage::PostUpdate, sync_pixel_rigidbodies_render_system)
             .add_system_to_stage(CoreStage::PostUpdate, sync_player_visuals_system);
     }
 }
@@ -258,7 +257,11 @@ pub fn setup_player_system(
     player_tools.insert(tool_ent, PlayerTool { player: player_ent });
     transforms.insert(
         tool_ent,
-        Transform::from_translation(Vec3::new(spawn_pos.x - 1.0, spawn_pos.y - 3.5, PLAYER_LAYER + 0.1)),
+        Transform::from_translation(Vec3::new(
+            spawn_pos.x - 1.0,
+            spawn_pos.y - 3.5,
+            PLAYER_LAYER + 0.1,
+        )),
     );
 
     local_view.local_player_id = 0;
@@ -666,11 +669,7 @@ pub fn player_throw_particles_system(
                     atom.vx = (vel[0] * 0.5).round().clamp(-6.0, 6.0) as i8;
                     atom.vy = (vel[1] * 0.5).round().clamp(-6.0, 6.0) as i8;
 
-                    pool.push_particle(Particle::new(
-                        [spawn_vec.x, spawn_vec.y],
-                        vel,
-                        atom,
-                    ));
+                    pool.push_particle(Particle::new([spawn_vec.x, spawn_vec.y], vel, atom));
                 }
             }
         }
@@ -855,6 +854,79 @@ pub fn update_local_view_camera_system(
     }
 }
 
+static NEXT_RIGIDBODY_CID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_rigidbody_cid() -> Cid {
+    let id = NEXT_RIGIDBODY_CID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut bytes = [0u8; 32];
+    bytes[0..8].copy_from_slice(b"ASTR_RB_");
+    bytes[8..16].copy_from_slice(&id.to_le_bytes());
+    Cid(bytes)
+}
+
+/// Interpolates and synchronizes `Transform` translation and rotation for all active
+/// [`PhysicsBodyHandle`] entities, and ensures dynamic rigidbodies have uploaded [`Sprite`] textures.
+pub fn sync_pixel_rigidbodies_render_system(
+    local_view: Res<LocalView>,
+    asset_server: Option<Res<AssetServer>>,
+    entities: Res<Entities>,
+    handles: Comp<astratomic_physics::rigidbody::PhysicsBodyHandle>,
+    mut pixel_bodies: CompMut<astratomic_physics::rigidbody::PixelRigidBody>,
+    mut transforms: CompMut<Transform>,
+    mut sprites: CompMut<Sprite>,
+) {
+    let alpha = local_view.render_alpha.clamp(0.0, 1.0);
+    for (ent, handle) in entities.iter_with(&handles) {
+        let interp_pos = handle.prev_pos.lerp(handle.pos, alpha);
+        let interp_angle = handle.prev_angle + (handle.angle - handle.prev_angle) * alpha;
+        if let Some(transform) = transforms.get_mut(ent) {
+            transform.translation.x = interp_pos.x;
+            transform.translation.y = interp_pos.y;
+            transform.translation.z = 1.0;
+            transform.rotation = Quat::from_rotation_z(interp_angle);
+        }
+
+        if let Some(ref server) = asset_server {
+            if let Some(pbody) = pixel_bodies.get_mut(ent) {
+                if pbody.image_handle.is_none() || !sprites.contains(ent) {
+                    let img = pbody.to_image();
+                    let handle = UntypedHandle {
+                        rid: Ulid::create(),
+                    }
+                    .typed::<Image>();
+                    let untyped = handle.untyped();
+                    let cid = next_rigidbody_cid();
+
+                    server.store.assets.insert(
+                        cid,
+                        LoadedAsset {
+                            cid,
+                            pack_spec: None,
+                            loc: AssetLoc {
+                                path: std::path::PathBuf::new(),
+                                pack: None,
+                            },
+                            dependencies: Vec::new(),
+                            data: SchemaBox::new(img),
+                        },
+                    );
+                    server.store.asset_ids.insert(untyped, cid);
+                    pbody.image_handle = Some(handle);
+                    sprites.insert(
+                        ent,
+                        Sprite {
+                            color: Color::WHITE,
+                            image: handle,
+                            flip_x: false,
+                            flip_y: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Synchronizes `AtlasSprite` animation frames and facing direction for all player entities,
 /// as well as positioning, rotation, and flipping for the player's tool sprite.
 pub fn sync_player_visuals_system(
@@ -1010,7 +1082,9 @@ mod tests {
     fn test_tool_excavates_terrain_and_spawns_homing_particles() {
         use astratomic_physics::prelude::world_cell_to_global_atom;
         use astratomic_sim::chunk::Chunk;
-        use astratomic_sim::particle::{PARTICLE_FOLLOW_ACTOR, step_particle_simulation_with_targets};
+        use astratomic_sim::particle::{
+            PARTICLE_FOLLOW_ACTOR, step_particle_simulation_with_targets,
+        };
 
         register_player_schemas();
         astratomic_sim::plugin::register_sim_schemas();
@@ -1033,7 +1107,11 @@ mod tests {
                 }
             }
             // Fill an obstacle patch of sand at wx in 8..=16, wy in -2..=2
-            let sand = Atom::with_state(2, astratomic_sim::atom::AtomState::Powder, [230, 197, 92, 255]);
+            let sand = Atom::with_state(
+                2,
+                astratomic_sim::atom::AtomState::Powder,
+                [230, 197, 92, 255],
+            );
             for wx in 8..=16 {
                 for wy in -2..=2 {
                     let cp = global_to_chunk(world_cell_to_global_atom(wx, wy));
@@ -1053,16 +1131,19 @@ mod tests {
             let ent = entities.create();
             players.insert(ent, Player);
             player_controlled.insert(ent, PlayerControlled { player_id: 0 });
-            actors.insert(ent, KinematicActor {
-                pos: Vec2::new(0.0, 0.0),
-                prev_pos: Vec2::new(0.0, 0.0),
-                vel: Vec2::ZERO,
-                half_size: PLAYER_HALF_SIZE,
-                step_height: PLAYER_STEP_HEIGHT,
-                weight: 70.0,
-                grounded: true,
-                ground_normal: Vec2::Y,
-            });
+            actors.insert(
+                ent,
+                KinematicActor {
+                    pos: Vec2::new(0.0, 0.0),
+                    prev_pos: Vec2::new(0.0, 0.0),
+                    vel: Vec2::ZERO,
+                    half_size: PLAYER_HALF_SIZE,
+                    step_height: PLAYER_STEP_HEIGHT,
+                    weight: 70.0,
+                    grounded: true,
+                    ground_normal: Vec2::Y,
+                },
+            );
             states.insert(ent, ActorState::default());
             ent
         };
@@ -1080,14 +1161,23 @@ mod tests {
         }
 
         // Sync targets and run action system
-        session.world.run_system(sync_actor_particle_targets_system, ());
+        session
+            .world
+            .run_system(sync_actor_particle_targets_system, ());
         session.world.run_system(player_world_action_system, ());
 
         // Verify that homing matter particles were spawned into ParticlePool
         {
             let pool = session.world.resource::<ParticlePool>();
-            let matter_particles: Vec<_> = pool.particles().iter().filter(|p| p.atom.life_5bit() == 0).collect();
-            assert!(!matter_particles.is_empty(), "excavator must spawn homing matter particles");
+            let matter_particles: Vec<_> = pool
+                .particles()
+                .iter()
+                .filter(|p| p.atom.life_5bit() == 0)
+                .collect();
+            assert!(
+                !matter_particles.is_empty(),
+                "excavator must spawn homing matter particles"
+            );
             for p in matter_particles {
                 assert_eq!(p.target_actor_id, player_actor_id(0));
                 assert_ne!(p.flags & PARTICLE_FOLLOW_ACTOR, 0);
@@ -1117,8 +1207,15 @@ mod tests {
         }
 
         let final_pool = session.world.resource::<ParticlePool>();
-        let remaining_matter = final_pool.particles().iter().filter(|p| p.atom.life_5bit() == 0).count();
-        assert_eq!(remaining_matter, 0, "all homing matter particles must despawn upon reaching the player");
+        let remaining_matter = final_pool
+            .particles()
+            .iter()
+            .filter(|p| p.atom.life_5bit() == 0)
+            .count();
+        assert_eq!(
+            remaining_matter, 0,
+            "all homing matter particles must despawn upon reaching the player"
+        );
     }
 
     #[test]
@@ -1148,7 +1245,11 @@ mod tests {
             }
             // Put a rock wall at wx = 20 (wy in -15..=15) in front of the player
             // and a floor at wy = -10 (wx in 0..=30) to catch falling particles
-            let rock = Atom::with_state(8, astratomic_sim::atom::AtomState::Solid, [128, 128, 128, 255]);
+            let rock = Atom::with_state(
+                8,
+                astratomic_sim::atom::AtomState::Solid,
+                [128, 128, 128, 255],
+            );
             for wy in -15..=15 {
                 let cp = global_to_chunk(world_cell_to_global_atom(20, wy));
                 world.set_atom(cp, rock);
@@ -1170,16 +1271,19 @@ mod tests {
             let ent = entities.create();
             players.insert(ent, Player);
             player_controlled.insert(ent, PlayerControlled { player_id: 0 });
-            actors.insert(ent, KinematicActor {
-                pos: Vec2::new(0.0, 0.0),
-                prev_pos: Vec2::new(0.0, 0.0),
-                vel: Vec2::ZERO,
-                half_size: PLAYER_HALF_SIZE,
-                step_height: PLAYER_STEP_HEIGHT,
-                weight: 70.0,
-                grounded: true,
-                ground_normal: Vec2::Y,
-            });
+            actors.insert(
+                ent,
+                KinematicActor {
+                    pos: Vec2::new(0.0, 0.0),
+                    prev_pos: Vec2::new(0.0, 0.0),
+                    vel: Vec2::ZERO,
+                    half_size: PLAYER_HALF_SIZE,
+                    step_height: PLAYER_STEP_HEIGHT,
+                    weight: 70.0,
+                    grounded: true,
+                    ground_normal: Vec2::Y,
+                },
+            );
             states.insert(ent, ActorState::default());
         }
 
@@ -1233,7 +1337,10 @@ mod tests {
                 }
             }
         }
-        assert!(gravel_settled > 0, "thrown particles must settle into terrain upon collision");
+        assert!(
+            gravel_settled > 0,
+            "thrown particles must settle into terrain upon collision"
+        );
     }
 
     #[test]
@@ -1257,18 +1364,24 @@ mod tests {
             let ent = entities.create();
             players.insert(ent, Player);
             player_controlled.insert(ent, PlayerControlled { player_id: 0 });
-            actors.insert(ent, KinematicActor {
-                pos: Vec2::new(10.0, 20.0),
-                prev_pos: Vec2::new(10.0, 20.0),
-                vel: Vec2::ZERO,
-                half_size: PLAYER_HALF_SIZE,
-                step_height: PLAYER_STEP_HEIGHT,
-                weight: 70.0,
-                grounded: true,
-                ground_normal: Vec2::Y,
-            });
+            actors.insert(
+                ent,
+                KinematicActor {
+                    pos: Vec2::new(10.0, 20.0),
+                    prev_pos: Vec2::new(10.0, 20.0),
+                    vel: Vec2::ZERO,
+                    half_size: PLAYER_HALF_SIZE,
+                    step_height: PLAYER_STEP_HEIGHT,
+                    weight: 70.0,
+                    grounded: true,
+                    ground_normal: Vec2::Y,
+                },
+            );
             states.insert(ent, ActorState::default());
-            transforms.insert(ent, Transform::from_translation(Vec3::new(10.0, 20.0, PLAYER_LAYER)));
+            transforms.insert(
+                ent,
+                Transform::from_translation(Vec3::new(10.0, 20.0, PLAYER_LAYER)),
+            );
             ent
         };
 
@@ -1334,7 +1447,10 @@ mod tests {
 
         {
             let entities = session.world.resource::<Entities>();
-            assert!(!entities.is_alive(tool_ent), "orphaned tool must be despawned when player is destroyed");
+            assert!(
+                !entities.is_alive(tool_ent),
+                "orphaned tool must be despawned when player is destroyed"
+            );
         }
     }
 }

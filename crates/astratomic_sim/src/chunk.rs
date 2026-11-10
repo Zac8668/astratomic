@@ -109,6 +109,7 @@ pub struct Chunk {
     pub texture: Handle<Image>,
     pub entity: Option<Entity>,
     pub auto_save: Option<ChunkAutoSave>,
+    pub collider_dirty: bool,
 }
 
 impl Clone for Chunk {
@@ -120,13 +121,17 @@ impl Clone for Chunk {
             // Cloned rollback snapshots do not inherit the auto-save hook so dropping a snapshot
             // never overwrites active world state.
             auto_save: None,
+            collider_dirty: self.collider_dirty,
         }
     }
 }
 
 impl PartialEq for Chunk {
     fn eq(&self, other: &Self) -> bool {
-        self.grid == other.grid && self.texture == other.texture && self.entity == other.entity
+        self.grid == other.grid
+            && self.texture == other.texture
+            && self.entity == other.entity
+            && self.collider_dirty == other.collider_dirty
     }
 }
 
@@ -137,6 +142,7 @@ impl Default for Chunk {
             texture: Handle::default(),
             entity: None,
             auto_save: None,
+            collider_dirty: true,
         }
     }
 }
@@ -158,6 +164,7 @@ impl Chunk {
             texture: Handle::default(),
             entity: None,
             auto_save: None,
+            collider_dirty: true,
         }
     }
 
@@ -190,6 +197,7 @@ impl Chunk {
     /// Obtain a mutable reference to the underlying atom array via Copy-on-Write (`Arc::make_mut`).
     #[inline]
     pub fn atoms_mut(&mut self) -> &mut [Atom; CHUNK_SIZE * CHUNK_SIZE] {
+        self.collider_dirty = true;
         &mut Arc::make_mut(&mut self.grid).atoms
     }
 
@@ -201,6 +209,7 @@ impl Chunk {
     /// Obtain a mutable reference to an atom by 1D index using Copy-on-Write (`Arc::make_mut`).
     #[inline]
     pub fn get_mut_atom(&mut self, index: usize) -> Option<&mut Atom> {
+        self.collider_dirty = true;
         Arc::make_mut(&mut self.grid).atoms.get_mut(index)
     }
 

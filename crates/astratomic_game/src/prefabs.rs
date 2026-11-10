@@ -17,6 +17,9 @@ use bones_framework::prelude::*;
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 
+use astratomic_physics::rigidbody::{
+    PhysicsBodyHandle, PixelRigidBody, RapierPhysics, spawn_pixel_rigidbody_with_components,
+};
 use astratomic_sim::{
     atom::{Atom, Materials},
     consts::{CHUNK_LENGHT, LOAD_HEIGHT, LOAD_WIDTH},
@@ -842,6 +845,92 @@ impl SessionPlugin for AstratomicPrefabsPlugin {
     }
 }
 
+/// Creates a dynamic [`PixelRigidBody`] from a [`PrefabConfig`].
+///
+/// Reads the material ID from the `mask.png` red channel (where alpha > 0),
+/// extracts colors from `image.png`, and initializes atom states from `materials`.
+pub fn pixel_body_from_prefab(
+    config: &PrefabConfig,
+    materials: Option<&Materials>,
+    spawn_pos: Vec2,
+) -> PixelRigidBody {
+    let w = config.mask.width() as usize;
+    let h = config.mask.height() as usize;
+    let mut atoms = Vec::with_capacity(w * h);
+
+    let mask_raw = config.mask.as_raw();
+    let image_raw = config.image.as_raw();
+
+    for py in 0..h {
+        for px in 0..w {
+            let idx = (py * w + px) * 4;
+            let id = if idx < mask_raw.len() { mask_raw[idx] } else { 0 };
+            let alpha = if idx + 3 < mask_raw.len() { mask_raw[idx + 3] } else { 0 };
+
+            if alpha == 0 || id == 0 {
+                atoms.push(Atom::AIR);
+            } else {
+                let color = if idx + 3 < image_raw.len() {
+                    [
+                        image_raw[idx],
+                        image_raw[idx + 1],
+                        image_raw[idx + 2],
+                        image_raw[idx + 3].max(255),
+                    ]
+                } else {
+                    [200, 200, 200, 255]
+                };
+
+                let state = materials
+                    .and_then(|m| m.0.get(id as usize))
+                    .map(|m| m.default_state)
+                    .unwrap_or_else(|| astratomic_sim::atom::AtomState::default_for_material_id(id));
+
+                atoms.push(Atom::with_state(id, state, color));
+            }
+        }
+    }
+
+    PixelRigidBody {
+        width: w as u16,
+        height: h as u16,
+        atoms,
+        prev_pos: spawn_pos,
+        pos: spawn_pos,
+        prev_angle: 0.0,
+        angle: 0.0,
+        image_handle: None,
+        last_linvel: Vec2::ZERO,
+    }
+}
+
+/// Spawns a prefab as a dynamic [`PixelRigidBody`] into Rapier physics and ECS components.
+///
+/// The dynamic collider is generated using Marching Squares + RDP polyline simplification.
+pub fn spawn_prefab_as_rigidbody(
+    config: &PrefabConfig,
+    materials: Option<&Materials>,
+    spawn_pos: Vec2,
+    physics: &mut RapierPhysics,
+    entities: &mut Entities,
+    handles: &mut CompMut<PhysicsBodyHandle>,
+    pixel_bodies: &mut CompMut<PixelRigidBody>,
+    transforms: &mut CompMut<Transform>,
+) -> Entity {
+    let body = pixel_body_from_prefab(config, materials, spawn_pos);
+    let ent = entities.create();
+    spawn_pixel_rigidbody_with_components(
+        ent,
+        physics,
+        materials,
+        body,
+        handles,
+        pixel_bodies,
+        transforms,
+    );
+    ent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,5 +1075,49 @@ mod tests {
             !placed_overlapping,
             "overlapping tree stamp should be rejected"
         );
+    }
+
+    #[test]
+    fn test_spawn_prefab_as_rigidbody() {
+        let configs = PrefabConfigs::load_from_assets_dir(resolve_assets_dir());
+        let tree_config = configs.0.iter().find(|c| c.name.contains("tree")).unwrap();
+        let materials = Materials::default_builtin();
+
+        let world = World::default();
+        world.init_resource::<Entities>();
+        world.init_resource::<RapierPhysics>();
+
+        let body = pixel_body_from_prefab(tree_config, Some(&materials), vec2(0.0, 50.0));
+        assert_eq!(body.width, tree_config.mask.width() as u16);
+        assert_eq!(body.height, tree_config.mask.height() as u16);
+        assert!(!body.atoms.is_empty());
+        assert!(body.atoms.iter().any(|a| !a.is_air()));
+
+        let ent = {
+            let mut physics = world.resource_mut::<RapierPhysics>();
+            let mut entities = world.resource_mut::<Entities>();
+            let mut handles = world.component_mut::<PhysicsBodyHandle>();
+            let mut pixel_bodies = world.component_mut::<PixelRigidBody>();
+            let mut transforms = world.component_mut::<Transform>();
+
+            spawn_prefab_as_rigidbody(
+                tree_config,
+                Some(&materials),
+                vec2(0.0, 50.0),
+                &mut physics,
+                &mut entities,
+                &mut handles,
+                &mut pixel_bodies,
+                &mut transforms,
+            )
+        };
+
+        let physics = world.resource::<RapierPhysics>();
+        let handles = world.component::<PhysicsBodyHandle>();
+        assert!(!physics.bodies.is_empty());
+        assert!(!physics.colliders.is_empty());
+        let h = handles.get(ent).expect("Entity must have PhysicsBodyHandle");
+        let rb = physics.bodies.get(h.handle()).expect("RigidBody must exist in Rapier");
+        assert!(rb.is_dynamic());
     }
 }

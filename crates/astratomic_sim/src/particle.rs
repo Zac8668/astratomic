@@ -7,10 +7,7 @@ use bones_schema::HasSchema;
 
 use crate::{
     atom::Atom,
-    world::{
-        ChunkWorld, DirtyRects, global_to_chunk, update_dirty_rects,
-        update_dirty_rects_3x3,
-    },
+    world::{ChunkWorld, DirtyRects, global_to_chunk, update_dirty_rects, update_dirty_rects_3x3},
 };
 
 /// Reuses `FLAG_SLIDE_LEFT` while in flight to indicate that an ephemeral FX particle bounces.
@@ -191,11 +188,7 @@ impl ParticlePool {
         atom.vx = 0;
         atom.vy = 0;
 
-        self.push_particle(Particle::new(
-            [gx as f32 + 0.5, gy as f32 + 0.5],
-            vel,
-            atom,
-        ));
+        self.push_particle(Particle::new([gx as f32 + 0.5, gy as f32 + 0.5], vel, atom));
         true
     }
 
@@ -318,6 +311,12 @@ impl ParticlePool {
     #[inline]
     pub fn particles(&self) -> &[Particle] {
         &self.active
+    }
+
+    /// Mutable slice view of all active particles via Copy-on-Write (`Arc::make_mut`).
+    #[inline]
+    pub fn particles_mut(&mut self) -> &mut [Particle] {
+        Arc::make_mut(&mut self.active).as_mut_slice()
     }
 }
 
@@ -476,7 +475,9 @@ pub fn step_particle_simulation_with_targets(
         // 2. Homing vs Standard Physics
         let is_homing_requested = (p.flags & PARTICLE_FOLLOW_ACTOR) != 0 && p.target_actor_id != 0;
         let target = if is_homing_requested {
-            actor_targets.iter().find(|t| t.actor_id == p.target_actor_id)
+            actor_targets
+                .iter()
+                .find(|t| t.actor_id == p.target_actor_id)
         } else {
             None
         };
@@ -509,7 +510,9 @@ pub fn step_particle_simulation_with_targets(
             // Directly steer toward target nozzle and smoothly accelerate
             if dist > 1e-4 {
                 let dir = [to_target[0] / dist, to_target[1] / dist];
-                let cur_mag = (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt().clamp(0.0, 6.0);
+                let cur_mag = (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1])
+                    .sqrt()
+                    .clamp(0.0, 6.0);
                 let new_mag = cur_mag + 0.5;
                 p.vel[0] = dir[0] * new_mag;
                 p.vel[1] = dir[1] * new_mag;
@@ -533,8 +536,12 @@ pub fn step_particle_simulation_with_targets(
 
         // Actor Touch Check at new_pos to prevent tunneling past the actor when moving fast:
         if let Some(target) = target {
-            let new_to_target = [target.center_pos[0] - new_pos[0], target.center_pos[1] - new_pos[1]];
-            let new_dist_sq = new_to_target[0] * new_to_target[0] + new_to_target[1] * new_to_target[1];
+            let new_to_target = [
+                target.center_pos[0] - new_pos[0],
+                target.center_pos[1] - new_pos[1],
+            ];
+            let new_dist_sq =
+                new_to_target[0] * new_to_target[0] + new_to_target[1] * new_to_target[1];
             if new_dist_sq <= target.pickup_radius * target.pickup_radius {
                 if (p.flags & PARTICLE_REINSERT_ON_TOUCH) != 0 {
                     reinsert_particle_atom_with_dirty(
@@ -641,11 +648,7 @@ pub fn simulate_particles_system(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        atom::Materials,
-        chunk::Chunk,
-        plugin::register_sim_schemas,
-    };
+    use crate::{atom::Materials, chunk::Chunk, plugin::register_sim_schemas};
 
     #[test]
     fn test_particle_data_layout() {
@@ -828,7 +831,8 @@ mod tests {
         }
 
         // Spawn a real matter particle (sand, material_id = 2) at (10.5, 18.5) moving downward
-        let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
+        let mut sand_atom =
+            Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
         sand_atom.set_life_5bit(0); // 0 = real matter
         pool.push_particle(Particle::new([10.5, 18.5], [0.0, 2.0], sand_atom));
 
@@ -854,7 +858,10 @@ mod tests {
         let mut sand_count = 0;
         for x in 8..=12 {
             for y in 17..=19 {
-                if world.get_atom_global(x, y).is_some_and(|a| a.material_id == 2) {
+                if world
+                    .get_atom_global(x, y)
+                    .is_some_and(|a| a.material_id == 2)
+                {
                     sand_count += 1;
                 }
             }
@@ -914,7 +921,8 @@ mod tests {
         let (mut world, mut dirty, _) = setup_test_world();
         let mut pool = ParticlePool::new();
 
-        let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
+        let mut sand_atom =
+            Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
         sand_atom.set_life_5bit(0);
 
         // Spawn particle at (10.0, 10.0) targeting actor 1 at (10.0, 30.0) with outward pop velocity
@@ -958,7 +966,8 @@ mod tests {
         let (mut world, mut dirty, _) = setup_test_world();
         let mut pool = ParticlePool::new();
 
-        let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
+        let mut sand_atom =
+            Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
         sand_atom.set_life_5bit(0);
 
         // Spawn particle with PARTICLE_REINSERT_ON_TOUCH targeting actor 2
@@ -967,7 +976,9 @@ mod tests {
             vel: [0.0, 0.0],
             atom: sand_atom,
             target_actor_id: 2,
-            flags: PARTICLE_FOLLOW_ACTOR | PARTICLE_IGNORE_WORLD_COLLISION | PARTICLE_REINSERT_ON_TOUCH,
+            flags: PARTICLE_FOLLOW_ACTOR
+                | PARTICLE_IGNORE_WORLD_COLLISION
+                | PARTICLE_REINSERT_ON_TOUCH,
             _padding: [0; 6],
         });
 
@@ -1003,7 +1014,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_sand, "sand must be re-inserted into ChunkWorld when PARTICLE_REINSERT_ON_TOUCH is set");
+        assert!(
+            found_sand,
+            "sand must be re-inserted into ChunkWorld when PARTICLE_REINSERT_ON_TOUCH is set"
+        );
     }
 
     #[test]
@@ -1018,7 +1032,8 @@ mod tests {
             }
         }
 
-        let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
+        let mut sand_atom =
+            Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
         sand_atom.set_life_5bit(0);
 
         // Particle with PARTICLE_IGNORE_WORLD_COLLISION homing through the rock wall toward actor on the other side

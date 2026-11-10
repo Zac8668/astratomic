@@ -284,6 +284,7 @@ impl ChunkWorld {
     /// `Arc<ChunkGrid>` via `Arc::make_mut(&mut chunk.grid)`.
     pub fn get_mut_atom(&mut self, pos: ChunkPos) -> Option<&mut Atom> {
         let chunk = self.chunks.get_mut(&pos.chunk)?;
+        chunk.collider_dirty = true;
         let grid = Arc::make_mut(&mut chunk.grid);
         grid.atoms.get_mut(pos.atom.d1())
     }
@@ -306,7 +307,9 @@ impl ChunkWorld {
     /// Check if the atom at global grid coordinates `(gx, gy)` is air (or return false if chunk unloaded).
     #[inline]
     pub fn is_air_global(&self, gx: i32, gy: i32) -> bool {
-        self.get_atom_global(gx, gy).map(|a| a.is_air()).unwrap_or(false)
+        self.get_atom_global(gx, gy)
+            .map(|a| a.is_air())
+            .unwrap_or(false)
     }
 
     /// Paint a single global atom position and mark both update and render dirty rects.
@@ -1098,4 +1101,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
-

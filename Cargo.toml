@@ -25,7 +25,7 @@ bones_schema = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
 bones_wgpu_renderer = { git = "https://github.com/Zac8668/bones.git", branch = "wgpu" }
 
 # Physics & geometry
-rapier2d = { version = "0.36", features = ["parallel", "enhanced-determinism"] }
+rapier2d = { version = "0.36", features = ["enhanced-determinism", "debug-render"] }
 
 # Storage, compression, & concurrency
 redb = "4.5"

@@ -7,8 +7,8 @@ use astratomic_sim::{
     consts::{FUEL_MAX, PLAYER_STEP_HEIGHT},
     particle::ParticlePool,
     world::{
-        ChunkPos, ChunkWorld, DirtyRects, SimulationSettings, global_to_chunk,
-        update_dirty_rects, update_dirty_rects_3x3,
+        ChunkPos, ChunkWorld, DirtyRects, SimulationSettings, global_to_chunk, update_dirty_rects,
+        update_dirty_rects_3x3,
     },
 };
 use bones_framework::prelude::*;
@@ -442,8 +442,8 @@ fn handle_vertical_floor_impact(
         actor.vel.x *= 1.0 - horiz_absorption;
 
         if let Some(ref mut pool) = particle_pool {
-            let speed_scale = (impact_speed * 0.45)
-                * (actor_weight / (avg_mat_weight * 40.0)).clamp(0.4, 2.5);
+            let speed_scale =
+                (impact_speed * 0.45) * (actor_weight / (avg_mat_weight * 40.0)).clamp(0.4, 2.5);
 
             // Eject real powder matter atoms into the air to dent the pile
             let eject_count = ((impact_speed * 1.2 * (weight_ratio * 0.4)).round() as usize)
@@ -460,8 +460,8 @@ fn handle_vertical_floor_impact(
                 } else {
                     -1.0
                 };
-                let p_vx = outward_sign * (0.6 + fastrand::f32() * 0.8) * speed_scale
-                    + actor.vel.x * 0.2;
+                let p_vx =
+                    outward_sign * (0.6 + fastrand::f32() * 0.8) * speed_scale + actor.vel.x * 0.2;
                 let p_vy = -(0.8 + fastrand::f32() * 0.8) * speed_scale;
 
                 if let Some(ref mut dr) = dirty_rects {
@@ -527,8 +527,8 @@ fn handle_vertical_floor_impact(
                 .max(0.1);
         }
         let avg_mat_weight = total_w / solid_cells.len() as f32;
-        let speed_scale = (impact_speed * 0.42)
-            * (actor_weight / (avg_mat_weight * 40.0)).clamp(0.4, 2.2);
+        let speed_scale =
+            (impact_speed * 0.42) * (actor_weight / (avg_mat_weight * 40.0)).clamp(0.4, 2.2);
 
         // Minor friction on hard solid floors
         actor.vel.x *= 0.95;
@@ -563,8 +563,8 @@ fn handle_vertical_floor_impact(
             .map(|m| m.get_from_atom(&sample_atom).weight)
             .unwrap_or(1.0)
             .max(0.1);
-        let speed_scale = (impact_speed * 0.45)
-            * (actor_weight / (mat_weight * 40.0)).clamp(0.4, 2.2);
+        let speed_scale =
+            (impact_speed * 0.45) * (actor_weight / (mat_weight * 40.0)).clamp(0.4, 2.2);
 
         if let Some(ref mut pool) = particle_pool {
             let center_gpos = world_cell_to_global_atom((x0 + x1) / 2, hit_wy);
@@ -873,15 +873,21 @@ fn handle_fluid_interaction(
         if is_moving && speed > 0.8 {
             if let Some(ref mut pool) = particle_pool {
                 let (sample_gpos, sample_atom, _) = dominant_fluid_atom.unwrap();
-                let splash_speed = (speed * 0.45)
-                    * (actor_weight / (avg_mat_weight * 40.0)).clamp(0.4, 2.2);
+                let splash_speed =
+                    (speed * 0.45) * (actor_weight / (avg_mat_weight * 40.0)).clamp(0.4, 2.2);
 
                 let p_vx = (fastrand::f32() * 2.0 - 1.0) * splash_speed * 1.2;
                 let p_vy = -(0.8 + fastrand::f32() * 0.8) * splash_speed;
 
                 // 1. Eject real liquid droplet atom
                 if let Some(ref mut dr) = dirty_rects {
-                    pool.eject_from_grid_dirty(chunk_world, dr, sample_gpos.x, sample_gpos.y, [p_vx, p_vy]);
+                    pool.eject_from_grid_dirty(
+                        chunk_world,
+                        dr,
+                        sample_gpos.x,
+                        sample_gpos.y,
+                        [p_vx, p_vy],
+                    );
                 } else {
                     pool.eject_from_grid(chunk_world, sample_gpos.x, sample_gpos.y, [p_vx, p_vy]);
                 }
@@ -984,13 +990,7 @@ pub fn step_kinematic_actor_full(
 
             if upper_clear {
                 let feet_has_solid = step_height > 0
-                    && cells_have_solid(
-                        chunk_world,
-                        lead_wx_start,
-                        lead_wx_end,
-                        feet_y0,
-                        feet_y1,
-                    );
+                    && cells_have_solid(chunk_world, lead_wx_start, lead_wx_end, feet_y0, feet_y1);
 
                 if !feet_has_solid {
                     actor.pos.x = new_x;
@@ -1121,8 +1121,8 @@ pub fn step_kinematic_actor_full(
                 if let Some(wy) = hit_wy {
                     let snapped = ((wy + 1) as f32) + half_h + SKIN;
                     actor.pos.y = snapped.min(actor.pos.y);
-                    let is_landing = (!was_grounded || initial_vel.y < -0.8)
-                        && initial_vel.y.abs() >= 0.6;
+                    let is_landing =
+                        (!was_grounded || initial_vel.y < -0.8) && initial_vel.y.abs() >= 0.6;
                     if is_landing {
                         handle_vertical_floor_impact(
                             chunk_world,
@@ -1299,6 +1299,7 @@ pub fn kinematic_actor_movement_system(
     materials: Option<Res<Materials>>,
     mut particle_pool: Option<ResMut<ParticlePool>>,
     mut dirty_rects: Option<ResMut<DirtyRects>>,
+    mut rapier_physics: Option<ResMut<crate::rigidbody::RapierPhysics>>,
     entities: Res<Entities>,
     mut actors: CompMut<KinematicActor>,
     mut states: CompMut<ActorState>,
@@ -1310,8 +1311,12 @@ pub fn kinematic_actor_movement_system(
         return;
     }
 
-    let mut actor_entities: Vec<Entity> =
-        entities.iter_with(&actors).map(|(ent, _)| ent).collect();
+    let obstacles = rapier_physics
+        .as_ref()
+        .map(|p| crate::rigidbody::collect_dynamic_obstacles(p))
+        .unwrap_or_default();
+
+    let mut actor_entities: Vec<Entity> = entities.iter_with(&actors).map(|(ent, _)| ent).collect();
     actor_entities.sort_unstable();
 
     for ent in actor_entities {
@@ -1319,6 +1324,9 @@ pub fn kinematic_actor_movement_system(
             continue;
         };
         let state = states.get_mut(ent);
+        let initial_vel = actor.vel;
+        let prev_pos = actor.prev_pos;
+
         step_kinematic_actor_full(
             &mut chunk_world,
             actor,
@@ -1327,6 +1335,23 @@ pub fn kinematic_actor_movement_system(
             particle_pool.as_deref_mut(),
             dirty_rects.as_deref_mut(),
         );
+
+        if let Some(ref mut physics) = rapier_physics
+            && !obstacles.is_empty()
+        {
+            crate::rigidbody::resolve_actor_dynamic_obstacles(
+                &mut actor.pos,
+                prev_pos,
+                &mut actor.vel,
+                &mut actor.grounded,
+                actor.half_size,
+                actor.step_height,
+                actor.weight,
+                initial_vel,
+                &obstacles,
+                physics,
+            );
+        }
     }
 }
 
@@ -1666,7 +1691,10 @@ mod tests {
 
         {
             let stamp = world.resource::<ActorSimulationStamp>();
-            assert!(!stamp.stamped_atoms.is_empty(), "should have stamped cells for the actor");
+            assert!(
+                !stamp.stamped_atoms.is_empty(),
+                "should have stamped cells for the actor"
+            );
             let cw = world.resource::<ChunkWorld>();
             let sample_cp = global_to_chunk(world_cell_to_global_atom(5, 5));
             let atom = cw.get_atom(&sample_cp).unwrap();
@@ -1736,7 +1764,10 @@ mod tests {
         let sand = Atom::with_state(2, AtomState::Powder, [230, 197, 92, 255]);
         let sand_cp = global_to_chunk(world_cell_to_global_atom(5, 8));
         world.resource_mut::<ChunkWorld>().set_atom(sand_cp, sand);
-        world.resource_mut::<DirtyRects>().current.insert(sand_cp.chunk, URect::full_chunk());
+        world
+            .resource_mut::<DirtyRects>()
+            .current
+            .insert(sand_cp.chunk, URect::full_chunk());
 
         // Step simulation: sand tries to fall under gravity towards the actor's head (wy = 7)
         {
@@ -1979,8 +2010,14 @@ mod tests {
         );
 
         // Both plunge events must spawn splash particles
-        assert!(!light_pool.is_empty(), "fluid plunge must spawn splash particles");
-        assert!(!heavy_pool.is_empty(), "fluid plunge must spawn splash particles");
+        assert!(
+            !light_pool.is_empty(),
+            "fluid plunge must spawn splash particles"
+        );
+        assert!(
+            !heavy_pool.is_empty(),
+            "fluid plunge must spawn splash particles"
+        );
     }
 
     #[test]
@@ -2029,7 +2066,11 @@ mod tests {
         assert!(!pool.is_empty(), "landing on sand must create particles");
 
         // Verify that at least one particle in the pool is REAL MATTER (life_5bit == 0)
-        let real_matter_count = pool.particles().iter().filter(|p| p.atom.life_5bit() == 0).count();
+        let real_matter_count = pool
+            .particles()
+            .iter()
+            .filter(|p| p.atom.life_5bit() == 0)
+            .count();
         assert!(
             real_matter_count > 0,
             "landing on sand must eject at least 1 real matter particle (life_5bit == 0), got {}",
@@ -2104,7 +2145,10 @@ mod tests {
         );
 
         assert!(actor.grounded);
-        assert!(!pool.is_empty(), "landing on stone should spawn VFX chips and dust");
+        assert!(
+            !pool.is_empty(),
+            "landing on stone should spawn VFX chips and dust"
+        );
 
         // Verify ALL particles in pool are VFX-only (life_5bit > 0)
         for p in pool.particles() {
@@ -2173,7 +2217,11 @@ mod tests {
         assert!(!pool.is_empty(), "fluid splash must spawn particles");
 
         // Verify that real liquid matter droplet was ejected into the pool
-        let real_liquid_count = pool.particles().iter().filter(|p| p.atom.life_5bit() == 0).count();
+        let real_liquid_count = pool
+            .particles()
+            .iter()
+            .filter(|p| p.atom.life_5bit() == 0)
+            .count();
         assert!(
             real_liquid_count > 0,
             "fluid plunge must eject at least 1 real liquid atom (life_5bit == 0), got {}",
@@ -2181,7 +2229,11 @@ mod tests {
         );
 
         // Verify that VFX mist/foam particles are also present (life_5bit > 0)
-        let vfx_count = pool.particles().iter().filter(|p| p.atom.life_5bit() > 0).count();
+        let vfx_count = pool
+            .particles()
+            .iter()
+            .filter(|p| p.atom.life_5bit() > 0)
+            .count();
         assert!(
             vfx_count > 0,
             "fluid plunge must spawn VFX mist/foam particles alongside real droplets, got {}",
@@ -2236,7 +2288,11 @@ mod tests {
             Some(&mut dirty_rects),
         );
 
-        let real_particles = pool.particles().iter().filter(|p| p.atom.life_5bit() == 0).count();
+        let real_particles = pool
+            .particles()
+            .iter()
+            .filter(|p| p.atom.life_5bit() == 0)
+            .count();
         assert!(real_particles > 0, "must have ejected real matter");
 
         // Sand count in world is now decreased
@@ -2267,8 +2323,15 @@ mod tests {
         }
 
         // 3. Verify that all real matter particles have re-inserted into ChunkWorld
-        let remaining_real = pool.particles().iter().filter(|p| p.atom.life_5bit() == 0).count();
-        assert_eq!(remaining_real, 0, "all real matter particles must re-insert into ChunkWorld");
+        let remaining_real = pool
+            .particles()
+            .iter()
+            .filter(|p| p.atom.life_5bit() == 0)
+            .count();
+        assert_eq!(
+            remaining_real, 0,
+            "all real matter particles must re-insert into ChunkWorld"
+        );
 
         let mut final_sand_in_world = 0;
         for cy in -2..=2 {
@@ -2283,8 +2346,7 @@ mod tests {
             }
         }
         assert_eq!(
-            final_sand_in_world,
-            initial_sand_count,
+            final_sand_in_world, initial_sand_count,
             "matter strictly conserved after re-insertion"
         );
     }
@@ -2336,8 +2398,14 @@ mod tests {
             Some(&mut dirty_rects),
         );
 
-        assert!(!pool.is_empty(), "walking on ground must spawn footstep particles");
-        assert_eq!(state.footstep_ticks, 7, "footstep counter should reset to 7 ticks");
+        assert!(
+            !pool.is_empty(),
+            "walking on ground must spawn footstep particles"
+        );
+        assert_eq!(
+            state.footstep_ticks, 7,
+            "footstep counter should reset to 7 ticks"
+        );
 
         // Footstep particles should flick backward (p_vx < 0.0 when moving right)
         for p in pool.particles() {
@@ -2395,8 +2463,14 @@ mod tests {
             Some(&mut dirty_rects),
         );
 
-        assert!(!pool.is_empty(), "jumping takeoff must kick particles from ground");
-        assert!(!state.jumped_this_tick, "jumped_this_tick flag must be cleared");
+        assert!(
+            !pool.is_empty(),
+            "jumping takeoff must kick particles from ground"
+        );
+        assert!(
+            !state.jumped_this_tick,
+            "jumped_this_tick flag must be cleared"
+        );
     }
 
     #[test]
@@ -2580,7 +2654,10 @@ mod tests {
             Some(&mut pool),
             Some(&mut dirty_rects),
         );
-        assert!(!pool.is_empty(), "npc without state must spawn takeoff particles when jumping from ground");
+        assert!(
+            !pool.is_empty(),
+            "npc without state must spawn takeoff particles when jumping from ground"
+        );
         pool.clear();
 
         // 2. NPC Walking on ground across 6 pixels (state == None)
@@ -2607,6 +2684,9 @@ mod tests {
                 Some(&mut dirty_rects),
             );
         }
-        assert!(!pool.is_empty(), "npc walking on ground must spawn footstep particles");
+        assert!(
+            !pool.is_empty(),
+            "npc walking on ground must spawn footstep particles"
+        );
     }
 }

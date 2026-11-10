@@ -219,14 +219,22 @@ mod tests {
 
         {
             let state = session.world.resource::<ParticleRenderState>();
-            assert_eq!(state.entities.len(), 2, "should allocate 2 entities for 2 color groups");
+            assert_eq!(
+                state.entities.len(),
+                2,
+                "should allocate 2 entities for 2 color groups"
+            );
 
             let paths = session.world.component::<Path2d>();
             let p0 = paths.get(state.entities[0]).unwrap();
             let p1 = paths.get(state.entities[1]).unwrap();
             assert!(!p0.points.is_empty());
             assert!(!p1.points.is_empty());
-            assert_ne!(p0.color.r(), p1.color.r(), "each group must have distinct color");
+            assert_ne!(
+                p0.color.r(),
+                p1.color.r(),
+                "each group must have distinct color"
+            );
         }
 
         // 2. Clear particles in pool and run system again -> points should be cleared
@@ -242,7 +250,10 @@ mod tests {
             let paths = session.world.component::<Path2d>();
             for &ent in &state.entities {
                 let p = paths.get(ent).unwrap();
-                assert!(p.points.is_empty(), "points should be cleared when pool is empty");
+                assert!(
+                    p.points.is_empty(),
+                    "points should be cleared when pool is empty"
+                );
             }
         }
     }

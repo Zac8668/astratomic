@@ -109,10 +109,17 @@ impl SessionPlugin for AstratomicRenderPlugin {
     fn install(self, session: &mut Session) {
         register_render_schemas();
         session.world.init_resource::<ChunkRenderState>();
-        session.world.init_resource::<crate::particles::ParticleRenderState>();
-        session.world.init_resource::<crate::particles::ParticleRenderConfig>();
+        session
+            .world
+            .init_resource::<crate::particles::ParticleRenderState>();
+        session
+            .world
+            .init_resource::<crate::particles::ParticleRenderConfig>();
         session.add_system_to_stage(CoreStage::PostUpdate, sync_chunk_sprites_system);
-        session.add_system_to_stage(CoreStage::PostUpdate, crate::particles::render_particles_system);
+        session.add_system_to_stage(
+            CoreStage::PostUpdate,
+            crate::particles::render_particles_system,
+        );
     }
 }
 

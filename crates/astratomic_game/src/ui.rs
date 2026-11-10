@@ -3,10 +3,12 @@
 
 use std::collections::HashSet;
 
-use astratomic_physics::prelude::{ActorState, KinematicActor, find_surface_spawn_pos};
+use astratomic_physics::prelude::{
+    ActorState, KinematicActor, find_surface_spawn_pos, from_rapier_vec,
+};
 use astratomic_render::prelude::ParticleRenderConfig;
 use astratomic_sim::{
-    atom::{Atom, Materials},
+    atom::{Atom, AtomState, Materials},
     chunk::CHUNK_SIZE,
     geom_tools::{Line, circle_points, square_points},
     particle::{MAX_PARTICLES, Particle, ParticlePool},
@@ -36,6 +38,7 @@ pub enum DebugTab {
     Simulation = 2,
     Player = 3,
     WorldGen = 4,
+    Physics = 5,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, HasSchema)]
@@ -63,6 +66,7 @@ pub enum DebugToolMode {
     Brush = 1,
     PrefabStamp = 2,
     ParticleEmitter = 3,
+    PhysicsGrab = 4,
 }
 
 /// Session resource holding the state of the world debug UI, camera, and brush tools.
@@ -87,6 +91,20 @@ pub struct DebugToolState {
     pub camera_speed: f32,
     pub reset_camera_requested: bool,
     pub respawn_player_requested: bool,
+    pub spawn_crate_requested: bool,
+    pub spawn_boulder_requested: bool,
+    pub spawn_prefab_rigidbody_requested: bool,
+    pub grabbed_body: Option<[u32; 2]>,
+    pub show_rapier_colliders: bool,
+    pub show_rapier_terrain: bool,
+    pub show_rapier_aabbs: bool,
+    pub show_rapier_velocities: bool,
+    pub show_rapier_contacts: bool,
+    pub clear_all_bodies_requested: bool,
+    pub wake_all_bodies_requested: bool,
+    pub sleep_all_bodies_requested: bool,
+    pub rebuild_terrain_colliders_requested: bool,
+    pub delete_body_requested: Option<u32>,
     // --- Particle Testing Controls ---
     pub particle_spawn_type: ParticleSpawnType,
     pub particle_fx_color: [u8; 4],
@@ -112,6 +130,10 @@ pub struct DebugToolState {
     pub chunk_grid_path_entity: Option<Entity>,
     pub brush_cursor_path_entity: Option<Entity>,
     pub actor_debug_path_entity: Option<Entity>,
+    pub rapier_dynamic_path_entity: Option<Entity>,
+    pub rapier_terrain_path_entity: Option<Entity>,
+    pub rapier_aabb_path_entity: Option<Entity>,
+    pub rapier_vfx_path_entity: Option<Entity>,
 }
 
 impl Default for DebugToolState {
@@ -135,6 +157,20 @@ impl Default for DebugToolState {
             camera_speed: 320.0,
             reset_camera_requested: false,
             respawn_player_requested: false,
+            spawn_crate_requested: false,
+            spawn_boulder_requested: false,
+            spawn_prefab_rigidbody_requested: false,
+            grabbed_body: None,
+            show_rapier_colliders: true,
+            show_rapier_terrain: true,
+            show_rapier_aabbs: false,
+            show_rapier_velocities: true,
+            show_rapier_contacts: false,
+            clear_all_bodies_requested: false,
+            wake_all_bodies_requested: false,
+            sleep_all_bodies_requested: false,
+            rebuild_terrain_colliders_requested: false,
+            delete_body_requested: None,
             particle_spawn_type: ParticleSpawnType::Fx,
             particle_fx_color: [255, 180, 40, 255], // spark orange
             particle_fx_lifetime: 20,
@@ -157,6 +193,10 @@ impl Default for DebugToolState {
             chunk_grid_path_entity: None,
             brush_cursor_path_entity: None,
             actor_debug_path_entity: None,
+            rapier_dynamic_path_entity: None,
+            rapier_terrain_path_entity: None,
+            rapier_aabb_path_entity: None,
+            rapier_vfx_path_entity: None,
         }
     }
 }
@@ -182,7 +222,10 @@ impl SessionPlugin for AstratomicDebugUiPlugin {
             .add_system_to_stage(CoreStage::PreUpdate, track_input_state_system)
             .add_system_to_stage(CoreStage::Update, camera_control_system)
             .add_system_to_stage(CoreStage::Update, world_debug_tool_system)
+            .add_system_to_stage(CoreStage::Update, debug_spawn_rigidbody_system)
+            .add_system_to_stage(CoreStage::Update, debug_physics_grab_system)
             .add_system_to_stage(CoreStage::PostUpdate, debug_overlays_system)
+            .add_system_to_stage(CoreStage::PostUpdate, debug_rapier_overlays_system)
             .add_system_to_stage(CoreStage::PostUpdate, debug_ui_system);
     }
 }
@@ -272,6 +315,12 @@ pub fn camera_control_system(
     if !egui_wants_kb {
         if state.just_pressed_keys.contains(&KeyCode::P) {
             sim_settings.paused = !sim_settings.paused;
+        }
+        if state.just_pressed_keys.contains(&KeyCode::C) {
+            state.spawn_crate_requested = true;
+        }
+        if state.just_pressed_keys.contains(&KeyCode::B) {
+            state.spawn_boulder_requested = true;
         }
         let hotkey_materials = [
             (KeyCode::Key0, 0_u8),
@@ -394,6 +443,255 @@ pub fn camera_control_system(
     }
 }
 
+/// Debug tool system to spawn dynamic crates ('C') or boulders ('B') at the cursor position
+/// and execute physics control requests (wake, sleep, clear, rebuild colliders).
+pub fn debug_spawn_rigidbody_system(
+    mut entities: ResMut<Entities>,
+    egui_ctx: Option<Res<EguiCtx>>,
+    mouse_world: Option<Res<MouseWorldPosition>>,
+    local_view: Res<LocalView>,
+    materials: Option<Res<Materials>>,
+    prefab_configs: Option<Res<PrefabConfigs>>,
+    mut chunk_world: Option<ResMut<ChunkWorld>>,
+    mut rapier_physics: Option<ResMut<astratomic_physics::rigidbody::RapierPhysics>>,
+    mut handles: CompMut<astratomic_physics::rigidbody::PhysicsBodyHandle>,
+    mut pixel_bodies: CompMut<astratomic_physics::rigidbody::PixelRigidBody>,
+    mut transforms: CompMut<Transform>,
+    mut state: ResMut<DebugToolState>,
+) {
+    // 1. Process physics lifecycle and maintenance requests
+    if state.wake_all_bodies_requested {
+        state.wake_all_bodies_requested = false;
+        if let Some(ref mut physics) = rapier_physics {
+            for (_h, rb) in physics.bodies.iter_mut() {
+                if rb.is_dynamic() {
+                    rb.wake_up(true);
+                }
+            }
+        }
+    }
+
+    if state.sleep_all_bodies_requested {
+        state.sleep_all_bodies_requested = false;
+        if let Some(ref mut physics) = rapier_physics {
+            for (_h, rb) in physics.bodies.iter_mut() {
+                if rb.is_dynamic() {
+                    rb.sleep();
+                }
+            }
+        }
+    }
+
+    if state.clear_all_bodies_requested {
+        state.clear_all_bodies_requested = false;
+        if let Some(ref mut physics) = rapier_physics {
+            let to_remove: Vec<(Entity, astratomic_physics::prelude::PhysicsBodyHandle)> = entities
+                .iter_with(&handles)
+                .map(|(ent, h)| (ent, *h))
+                .collect();
+            for (ent, handle) in to_remove {
+                physics.remove_body(handle.handle());
+                entities.kill(ent);
+            }
+        }
+    }
+
+    if let Some(raw_idx) = state.delete_body_requested.take() {
+        if let Some(ref mut physics) = rapier_physics {
+            let found = entities
+                .iter_with(&handles)
+                .find(|(_ent, h)| h.handle().into_raw_parts().0 == raw_idx);
+            if let Some((ent, handle)) = found {
+                physics.remove_body(handle.handle());
+                entities.kill(ent);
+            }
+        }
+    }
+
+    if state.rebuild_terrain_colliders_requested {
+        state.rebuild_terrain_colliders_requested = false;
+        if let Some(ref mut physics) = rapier_physics {
+            physics.clear_chunk_colliders();
+            if let Some(ref mut cw) = chunk_world {
+                for chunk in cw.chunks.values_mut() {
+                    chunk.collider_dirty = true;
+                }
+            }
+        }
+    }
+
+    // 2. Process crate / boulder / prefab spawn requests
+    if !state.spawn_crate_requested
+        && !state.spawn_boulder_requested
+        && !state.spawn_prefab_rigidbody_requested
+    {
+        return;
+    }
+    let is_prefab = state.spawn_prefab_rigidbody_requested;
+    let is_crate = state.spawn_crate_requested;
+    state.spawn_crate_requested = false;
+    state.spawn_boulder_requested = false;
+    state.spawn_prefab_rigidbody_requested = false;
+
+    let Some(ref mut physics) = rapier_physics else {
+        eprintln!("Cannot spawn dynamic rigidbody: RapierPhysics resource is missing!");
+        return;
+    };
+
+    let egui_wants_pointer = egui_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.wants_pointer_input() || ctx.is_pointer_over_area());
+
+    // If spawned from egui button click, spawn slightly above camera center so the user sees it immediately.
+    // If spawned via hotkeys ('C' / 'B'), spawn directly at cursor world position.
+    let spawn_pos = if egui_wants_pointer {
+        local_view.camera_pos + Vec2::new(0.0, 30.0)
+    } else {
+        mouse_world
+            .as_ref()
+            .and_then(|m| m.0)
+            .unwrap_or(local_view.camera_pos + Vec2::new(0.0, 30.0))
+    };
+
+    if is_prefab {
+        if let Some(ref configs) = prefab_configs {
+            if let Some(config) = configs.0.get(state.selected_prefab_idx) {
+                crate::prefabs::spawn_prefab_as_rigidbody(
+                    config,
+                    materials.as_deref(),
+                    spawn_pos,
+                    physics,
+                    &mut entities,
+                    &mut handles,
+                    &mut pixel_bodies,
+                    &mut transforms,
+                );
+            }
+        }
+        return;
+    }
+
+    let body = if is_crate {
+        astratomic_physics::rigidbody::PixelRigidBody::new_crate(16, 16, spawn_pos)
+    } else {
+        astratomic_physics::rigidbody::PixelRigidBody::new_box(
+            16,
+            16,
+            Atom::with_state(1, AtomState::Solid, [128, 128, 128, 255]),
+            spawn_pos,
+        )
+    };
+
+    let ent = entities.create();
+    astratomic_physics::rigidbody::spawn_pixel_rigidbody_with_components(
+        ent,
+        physics,
+        materials.as_deref(),
+        body,
+        &mut handles,
+        &mut pixel_bodies,
+        &mut transforms,
+    );
+}
+
+/// Allows the user to grab, manipulate, and throw dynamic Rapier rigidbodies using the mouse.
+pub fn debug_physics_grab_system(
+    egui_ctx: Option<Res<EguiCtx>>,
+    mouse_world: Option<Res<MouseWorldPosition>>,
+    mut rapier_physics: Option<ResMut<astratomic_physics::rigidbody::RapierPhysics>>,
+    mut state: ResMut<DebugToolState>,
+) {
+    let Some(ref mut physics) = rapier_physics else {
+        state.grabbed_body = None;
+        return;
+    };
+
+    let egui_wants_pointer = egui_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.wants_pointer_input() || ctx.is_pointer_over_area());
+
+    if egui_wants_pointer {
+        state.grabbed_body = None;
+        return;
+    }
+
+    if !matches!(state.tool_mode, DebugToolMode::PhysicsGrab) {
+        state.grabbed_body = None;
+        return;
+    }
+
+    let Some(cursor_world) = mouse_world.and_then(|mw| mw.0) else {
+        state.grabbed_body = None;
+        return;
+    };
+
+    let left_down = state.held_mouse.contains(&MouseButton::Left);
+    let left_just_pressed = state.just_pressed_mouse.contains(&MouseButton::Left);
+
+    if left_down {
+        // If not holding anything yet, check if we clicked on a dynamic body
+        if state.grabbed_body.is_none() && left_just_pressed {
+            let pt = astratomic_physics::prelude::to_rapier_vec(cursor_world);
+            let mut best_body: Option<(astratomic_physics::prelude::RigidBodyHandle, f32)> = None;
+
+            for (handle, body) in physics.bodies.iter() {
+                if !body.is_dynamic() {
+                    continue;
+                }
+                let body_pos = astratomic_physics::prelude::from_rapier_vec(body.translation());
+                let dist = (body_pos - cursor_world).length();
+
+                let mut hit = false;
+                for col_handle in body.colliders() {
+                    if let Some(col) = physics.colliders.get(*col_handle) {
+                        if col.shape().contains_point(col.position(), pt) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+
+                if hit || dist <= 16.0 {
+                    if best_body.map_or(true, |(_, d)| dist < d) {
+                        best_body = Some((handle, dist));
+                    }
+                }
+            }
+
+            if let Some((handle, _)) = best_body {
+                let (idx, generation) = handle.into_raw_parts();
+                state.grabbed_body = Some([idx, generation]);
+            }
+        }
+
+        // If holding a body, pull it toward cursor with a smooth spring drive
+        if let Some([idx, generation]) = state.grabbed_body {
+            let handle = astratomic_physics::prelude::RigidBodyHandle::from_raw_parts(idx, generation);
+            if let Some(rb) = physics.bodies.get_mut(handle) {
+                rb.wake_up(true);
+                let current_pos = astratomic_physics::prelude::from_rapier_vec(rb.translation());
+                let to_cursor = cursor_world - current_pos;
+                let dist = to_cursor.length();
+
+                let spring_speed = (dist * 22.0).clamp(0.0, 900.0);
+                let target_vel = if dist > 0.1 {
+                    (to_cursor / dist) * spring_speed
+                } else {
+                    Vec2::ZERO
+                };
+
+                rb.set_linvel(astratomic_physics::prelude::to_rapier_vec(target_vel), true);
+                let current_angvel = rb.angvel();
+                rb.set_angvel(current_angvel * 0.92, true);
+            } else {
+                state.grabbed_body = None;
+            }
+        }
+    } else {
+        state.grabbed_body = None;
+    }
+}
+
 /// Applies brush painting/erasing, prefab stamping, or particle emission at the cursor position.
 pub fn world_debug_tool_system(
     egui_ctx: Option<Res<EguiCtx>>,
@@ -496,7 +794,8 @@ pub fn world_debug_tool_system(
                 return;
             };
 
-            let should_emit = left_just_pressed || (state.particle_continuous_fountain && left_down);
+            let should_emit =
+                left_just_pressed || (state.particle_continuous_fountain && left_down);
             if should_emit {
                 match state.particle_spawn_type {
                     ParticleSpawnType::Fx => {
@@ -504,7 +803,8 @@ pub fn world_debug_tool_system(
                         let rad = (state.particle_angle_deg + spread).to_radians();
                         let speed = state.particle_speed * (0.85 + fastrand::f32() * 0.3);
                         let vel = [rad.cos() * speed, rad.sin() * speed];
-                        let spawn_pos = [cursor_global.x as f32 + 0.5, cursor_global.y as f32 + 0.5];
+                        let spawn_pos =
+                            [cursor_global.x as f32 + 0.5, cursor_global.y as f32 + 0.5];
                         pool.spawn_fx(
                             spawn_pos,
                             vel,
@@ -534,7 +834,8 @@ pub fn world_debug_tool_system(
                             atom.set_life_5bit(0);
                             atom.vx = 0;
                             atom.vy = 0;
-                            let spawn_pos = [cursor_global.x as f32 + 0.5, cursor_global.y as f32 + 0.5];
+                            let spawn_pos =
+                                [cursor_global.x as f32 + 0.5, cursor_global.y as f32 + 0.5];
                             pool.push_particle(Particle::new(spawn_pos, vel, atom));
                         }
                     }
@@ -561,7 +862,8 @@ pub fn world_debug_tool_system(
                                 let angle = fastrand::f32() * std::f32::consts::TAU;
                                 let speed = fastrand::f32() * state.particle_speed;
                                 let vel = [angle.cos() * speed, angle.sin() * speed];
-                                let spark_pos = [cursor_global.x as f32 + 0.5, cursor_global.y as f32 + 0.5];
+                                let spark_pos =
+                                    [cursor_global.x as f32 + 0.5, cursor_global.y as f32 + 0.5];
                                 let color = if fastrand::bool() {
                                     [255, 200, 50, 255]
                                 } else {
@@ -587,6 +889,10 @@ pub fn world_debug_tool_system(
                     pool.eject_from_grid_dirty(&mut chunk_world, &mut dirty_rects, pt.x, pt.y, vel);
                 }
             }
+        }
+        DebugToolMode::PhysicsGrab => {
+            // Handled deterministically in `debug_physics_grab_system`.
+            state.prev_cursor_global = None;
         }
     }
 }
@@ -717,6 +1023,7 @@ pub fn debug_overlays_system(
                 ParticleSpawnType::Explosion => [255, 140, 20, 255],
             },
             DebugToolMode::PrefabStamp => [180, 220, 255, 255],
+            DebugToolMode::PhysicsGrab => [255, 215, 0, 255],
             _ => Atom::material_preview_color(state.selected_material_id),
         };
         path.color = Color::rgba(
@@ -790,6 +1097,25 @@ pub fn debug_overlays_system(
                         path.line_breaks.push(path.points.len());
                     }
                 },
+                DebugToolMode::PhysicsGrab => {
+                    const SEGMENTS: usize = 16;
+                    let gr = 12.0;
+                    for i in 0..=SEGMENTS {
+                        let angle = (i as f32 / SEGMENTS as f32) * std::f32::consts::TAU;
+                        path.points.push(Vec2::new(
+                            cx + angle.cos() * gr,
+                            cy + angle.sin() * gr,
+                        ));
+                    }
+                    path.line_breaks.push(path.points.len());
+
+                    path.points.push(Vec2::new(cx - 4.0, cy));
+                    path.points.push(Vec2::new(cx + 4.0, cy));
+                    path.line_breaks.push(path.points.len());
+                    path.points.push(Vec2::new(cx, cy - 4.0));
+                    path.points.push(Vec2::new(cx, cy + 4.0));
+                    path.line_breaks.push(path.points.len());
+                }
                 DebugToolMode::PlayerTool => {}
             }
         }
@@ -847,6 +1173,268 @@ pub fn debug_overlays_system(
     // 5. Active particles are rendered on the GPU by `astratomic_render::particles::render_particles_system`.
 }
 
+struct RapierOverlayBackend<'a> {
+    dynamic_points: &'a mut Vec<Vec2>,
+    dynamic_breaks: &'a mut Vec<usize>,
+    terrain_points: &'a mut Vec<Vec2>,
+    terrain_breaks: &'a mut Vec<usize>,
+    aabb_points: &'a mut Vec<Vec2>,
+    aabb_breaks: &'a mut Vec<usize>,
+    contact_points: &'a mut Vec<Vec2>,
+    contact_breaks: &'a mut Vec<usize>,
+    show_dynamic: bool,
+    show_terrain: bool,
+    show_aabb: bool,
+    show_contacts: bool,
+}
+
+impl<'a> astratomic_physics::prelude::DebugRenderBackend for RapierOverlayBackend<'a> {
+    fn draw_line(
+        &mut self,
+        object: astratomic_physics::prelude::DebugRenderObject,
+        a: astratomic_physics::prelude::RapierVector,
+        b: astratomic_physics::prelude::RapierVector,
+        _color: astratomic_physics::prelude::DebugColor,
+    ) {
+        let p1 = Vec2::new(a.x, a.y);
+        let p2 = Vec2::new(b.x, b.y);
+
+        match object {
+            astratomic_physics::prelude::DebugRenderObject::Collider(_handle, collider) => {
+                let is_static_terrain = collider.parent().is_none();
+                if is_static_terrain {
+                    if self.show_terrain {
+                        self.terrain_points.push(p1);
+                        self.terrain_points.push(p2);
+                        self.terrain_breaks.push(self.terrain_points.len());
+                    }
+                } else if self.show_dynamic {
+                    self.dynamic_points.push(p1);
+                    self.dynamic_points.push(p2);
+                    self.dynamic_breaks.push(self.dynamic_points.len());
+                }
+            }
+            astratomic_physics::prelude::DebugRenderObject::ColliderAabb(
+                _handle,
+                _collider,
+                _aabb,
+            ) => {
+                if self.show_aabb {
+                    self.aabb_points.push(p1);
+                    self.aabb_points.push(p2);
+                    self.aabb_breaks.push(self.aabb_points.len());
+                }
+            }
+            astratomic_physics::prelude::DebugRenderObject::ContactPair(_pair, _c1, _c2) => {
+                if self.show_contacts {
+                    self.contact_points.push(p1);
+                    self.contact_points.push(p2);
+                    self.contact_breaks.push(self.contact_points.len());
+                }
+            }
+            astratomic_physics::prelude::DebugRenderObject::RigidBody(_handle, _rb) => {
+                if self.show_dynamic {
+                    self.dynamic_points.push(p1);
+                    self.dynamic_points.push(p2);
+                    self.dynamic_breaks.push(self.dynamic_points.len());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Renders wireframe debug overlays for Rapier physics (dynamic body colliders, chunk terrain colliders,
+/// collider AABB bounding boxes, velocity vectors, and contact points) using [`Path2d`].
+pub fn debug_rapier_overlays_system(
+    rapier_physics: Option<Res<astratomic_physics::rigidbody::RapierPhysics>>,
+    mouse_world: Option<Res<MouseWorldPosition>>,
+    mut entities: ResMut<Entities>,
+    mut transforms: CompMut<Transform>,
+    mut paths: CompMut<Path2d>,
+    mut state: ResMut<DebugToolState>,
+) {
+    let dyn_ent = ensure_overlay_entity(
+        &mut state.rapier_dynamic_path_entity,
+        &mut entities,
+        &mut transforms,
+        &mut paths,
+        14.0,
+    );
+    let terrain_ent = ensure_overlay_entity(
+        &mut state.rapier_terrain_path_entity,
+        &mut entities,
+        &mut transforms,
+        &mut paths,
+        13.0,
+    );
+    let aabb_ent = ensure_overlay_entity(
+        &mut state.rapier_aabb_path_entity,
+        &mut entities,
+        &mut transforms,
+        &mut paths,
+        12.0,
+    );
+    let vfx_ent = ensure_overlay_entity(
+        &mut state.rapier_vfx_path_entity,
+        &mut entities,
+        &mut transforms,
+        &mut paths,
+        15.0,
+    );
+
+    if let Some(path) = paths.get_mut(dyn_ent) {
+        path.points.clear();
+        path.line_breaks.clear();
+        path.color = Color::rgba(0.15, 0.95, 1.0, 0.95); // Bright cyan for dynamic body colliders
+        path.thickness = 1.0;
+    }
+    if let Some(path) = paths.get_mut(terrain_ent) {
+        path.points.clear();
+        path.line_breaks.clear();
+        path.color = Color::rgba(1.0, 0.62, 0.1, 0.85); // Bright amber-orange for chunk terrain colliders
+        path.thickness = 1.0;
+    }
+    if let Some(path) = paths.get_mut(aabb_ent) {
+        path.points.clear();
+        path.line_breaks.clear();
+        path.color = Color::rgba(1.0, 0.25, 0.4, 0.55); // Faint red for AABBs
+        path.thickness = 1.0;
+    }
+    if let Some(path) = paths.get_mut(vfx_ent) {
+        path.points.clear();
+        path.line_breaks.clear();
+        path.color = Color::rgba(1.0, 1.0, 0.2, 0.95); // Bright yellow for velocity arrows & contacts
+        path.thickness = 1.5;
+    }
+
+    let Some(ref physics) = rapier_physics else {
+        return;
+    };
+
+    let show_dyn = state.show_rapier_colliders;
+    let show_terrain = state.show_rapier_terrain;
+    let show_aabb = state.show_rapier_aabbs;
+    let show_contacts = state.show_rapier_contacts;
+    let show_vel = state.show_rapier_velocities;
+
+    if !show_dyn && !show_terrain && !show_aabb && !show_contacts && !show_vel {
+        return;
+    }
+
+    let mut mode = astratomic_physics::prelude::DebugRenderMode::empty();
+    if show_dyn || show_terrain {
+        mode |= astratomic_physics::prelude::DebugRenderMode::COLLIDER_SHAPES;
+        mode |= astratomic_physics::prelude::DebugRenderMode::RIGID_BODY_AXES;
+    }
+    if show_aabb {
+        mode |= astratomic_physics::prelude::DebugRenderMode::COLLIDER_AABBS;
+    }
+    if show_contacts {
+        mode |= astratomic_physics::prelude::DebugRenderMode::CONTACTS;
+    }
+
+    // 1. Run Rapier debug pipeline if any shapes/aabbs/contacts are enabled
+    if !mode.is_empty() {
+        let mut dyn_pts = Vec::new();
+        let mut dyn_brks = Vec::new();
+        let mut terrain_pts = Vec::new();
+        let mut terrain_brks = Vec::new();
+        let mut aabb_pts = Vec::new();
+        let mut aabb_brks = Vec::new();
+        let mut contact_pts = Vec::new();
+        let mut contact_brks = Vec::new();
+
+        {
+            let mut backend = RapierOverlayBackend {
+                dynamic_points: &mut dyn_pts,
+                dynamic_breaks: &mut dyn_brks,
+                terrain_points: &mut terrain_pts,
+                terrain_breaks: &mut terrain_brks,
+                aabb_points: &mut aabb_pts,
+                aabb_breaks: &mut aabb_brks,
+                contact_points: &mut contact_pts,
+                contact_breaks: &mut contact_brks,
+                show_dynamic: show_dyn,
+                show_terrain,
+                show_aabb,
+                show_contacts,
+            };
+            astratomic_physics::prelude::debug_render_rapier(physics, &mut backend, mode);
+        }
+
+        if let Some(path) = paths.get_mut(dyn_ent) {
+            path.points = dyn_pts;
+            path.line_breaks = dyn_brks;
+        }
+        if let Some(path) = paths.get_mut(terrain_ent) {
+            path.points = terrain_pts;
+            path.line_breaks = terrain_brks;
+        }
+        if let Some(path) = paths.get_mut(aabb_ent) {
+            path.points = aabb_pts;
+            path.line_breaks = aabb_brks;
+        }
+        if let Some(path) = paths.get_mut(vfx_ent) {
+            path.points = contact_pts;
+            path.line_breaks = contact_brks;
+        }
+    }
+
+    // 2. Render velocity vectors with arrows for active dynamic bodies
+    if show_vel {
+        if let Some(path) = paths.get_mut(vfx_ent) {
+            for (_handle, rb) in physics.bodies.iter() {
+                if rb.is_dynamic() {
+                    let pos = astratomic_physics::prelude::from_rapier_vec(rb.translation());
+                    let vel = astratomic_physics::prelude::from_rapier_vec(rb.linvel());
+                    let speed = vel.length();
+                    if speed > 0.5 {
+                        let dir = vel / speed;
+                        let end = pos + vel * 0.12; // 120ms velocity vector
+                        path.points.push(pos);
+                        path.points.push(end);
+                        path.line_breaks.push(path.points.len());
+
+                        // Arrowhead
+                        let normal = Vec2::new(-dir.y, dir.x) * 2.5;
+                        let arrow_back = end - dir * 4.0;
+                        path.points.push(end);
+                        path.points.push(arrow_back + normal);
+                        path.line_breaks.push(path.points.len());
+
+                        path.points.push(end);
+                        path.points.push(arrow_back - normal);
+                        path.line_breaks.push(path.points.len());
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Render grab tether line from grabbed body to mouse cursor
+    if let Some([idx, generation]) = state.grabbed_body {
+        let handle = astratomic_physics::prelude::RigidBodyHandle::from_raw_parts(idx, generation);
+        if let Some(rb) = physics.bodies.get(handle) {
+            let body_pos = astratomic_physics::prelude::from_rapier_vec(rb.translation());
+            if let Some(cursor_world) = mouse_world.and_then(|mw| mw.0) {
+                if let Some(path) = paths.get_mut(vfx_ent) {
+                    path.points.push(body_pos);
+                    path.points.push(cursor_world);
+                    path.line_breaks.push(path.points.len());
+
+                    const SEGMENTS: usize = 12;
+                    for i in 0..=SEGMENTS {
+                        let angle = (i as f32 / SEGMENTS as f32) * std::f32::consts::TAU;
+                        path.points.push(body_pos + Vec2::new(angle.cos() * 5.0, angle.sin() * 5.0));
+                    }
+                    path.line_breaks.push(path.points.len());
+                }
+            }
+        }
+    }
+}
+
 /// Renders the interactive `egui` World & Player Debug Window with a tabbed layout.
 pub fn debug_ui_system(
     egui_ctx: Option<Res<EguiCtx>>,
@@ -870,6 +1458,7 @@ pub fn debug_ui_system(
     mut prefab_placed: ResMut<PrefabPlaced>,
     mut pending_stamps: ResMut<PendingPrefabStamps>,
     io_worker: Res<WorldIoWorker>,
+    rapier_physics: Option<Res<astratomic_physics::rigidbody::RapierPhysics>>,
     mut state: ResMut<DebugToolState>,
 ) {
     let Some(ctx) = egui_ctx else {
@@ -937,6 +1526,7 @@ pub fn debug_ui_system(
                 ui.selectable_value(&mut state.selected_tab, DebugTab::Simulation, "⏱ Sim & Cam");
                 ui.selectable_value(&mut state.selected_tab, DebugTab::Player, "🏃 Player");
                 ui.selectable_value(&mut state.selected_tab, DebugTab::WorldGen, "🌍 World Gen");
+                ui.selectable_value(&mut state.selected_tab, DebugTab::Physics, "🪐 Rapier Physics");
             });
 
             ui.separator();
@@ -965,6 +1555,11 @@ pub fn debug_ui_system(
                             &mut state.tool_mode,
                             DebugToolMode::ParticleEmitter,
                             "✨ Particle Tool",
+                        );
+                        ui.selectable_value(
+                            &mut state.tool_mode,
+                            DebugToolMode::PhysicsGrab,
+                            "🧲 Physics Grab",
                         );
                     });
 
@@ -1021,6 +1616,9 @@ pub fn debug_ui_system(
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut state.snap_prefab_to_surface, "Snap to Surface");
                                 ui.checkbox(&mut state.overwrite_prefab_terrain, "Overwrite Terrain");
+                                if ui.button("🏗 Spawn as Rigidbody").clicked() {
+                                    state.spawn_prefab_rigidbody_requested = true;
+                                }
                             });
 
                             if prefab_configs.0.is_empty() {
@@ -1051,6 +1649,18 @@ pub fn debug_ui_system(
                                     state.selected_tab = DebugTab::Particles;
                                 }
                             });
+                        }
+                        DebugToolMode::PhysicsGrab => {
+                            ui.small("Left-Click & Drag: Grab and throw dynamic rigidbodies | Release to toss");
+                            if let Some(ref phys) = rapier_physics {
+                                let dynamic_count = phys.bodies.iter().filter(|(_, b)| b.is_dynamic()).count();
+                                ui.label(format!("Dynamic bodies in world: {}", dynamic_count));
+                                if let Some([idx, _]) = state.grabbed_body {
+                                    ui.strong(format!("Currently holding body #{}", idx));
+                                } else {
+                                    ui.small("Click on any dynamic body in the world to pick it up.");
+                                }
+                            }
                         }
                     }
 
@@ -1399,6 +2009,30 @@ pub fn debug_ui_system(
                             }
                         });
                     }
+
+                    ui.separator();
+                    ui.heading("Dynamic Rigidbodies & Physics");
+                    if let Some(ref phys) = rapier_physics {
+                        let active_bodies = phys.bodies.len();
+                        let chunk_colliders = phys.chunk_colliders.len();
+                        ui.label(format!("Dynamic Bodies: {} | Terrain Chunk Colliders: {}", active_bodies, chunk_colliders));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("📦 Spawn Wooden Crate (C)").clicked() {
+                            state.spawn_crate_requested = true;
+                        }
+                        if ui.button("🪨 Spawn Stone Boulder (B)").clicked() {
+                            state.spawn_boulder_requested = true;
+                        }
+                        if ui.button("🪐 Open Physics Tab ➡").clicked() {
+                            state.selected_tab = DebugTab::Physics;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut state.show_rapier_colliders, "Show Dynamic Colliders (Cyan)");
+                        ui.checkbox(&mut state.show_rapier_terrain, "Show Terrain Colliders (Orange)");
+                        ui.checkbox(&mut state.show_rapier_velocities, "Show Velocities (Yellow)");
+                    });
                 }
 
                 DebugTab::Simulation => {
@@ -1464,6 +2098,11 @@ pub fn debug_ui_system(
                     ui.heading("Debug Overlays");
                     ui.horizontal_wrapped(|ui| {
                         ui.checkbox(&mut state.show_actor_debug, "Actor Hitbox & Aim");
+                        ui.checkbox(&mut state.show_rapier_colliders, "Rapier Dynamic Colliders");
+                        ui.checkbox(&mut state.show_rapier_terrain, "Rapier Terrain Colliders");
+                        ui.checkbox(&mut state.show_rapier_velocities, "Rapier Velocities");
+                        ui.checkbox(&mut state.show_rapier_aabbs, "Rapier AABBs");
+                        ui.checkbox(&mut state.show_rapier_contacts, "Rapier Contacts");
                         ui.checkbox(&mut state.show_dirty_rects, "Dirty Rects");
                         ui.checkbox(&mut state.show_chunk_grid, "Chunk Grid");
                         ui.checkbox(&mut state.show_brush_cursor, "Brush Cursor");
@@ -1592,6 +2231,181 @@ pub fn debug_ui_system(
                             );
                         }
                     });
+                }
+
+                DebugTab::Physics => {
+                    ui.heading("🪐 Rapier2D Physics Inspector");
+                    if let Some(ref phys) = rapier_physics {
+                        let total_bodies = phys.bodies.len();
+                        let awake_bodies = phys
+                            .bodies
+                            .iter()
+                            .filter(|(_, b)| b.is_dynamic() && !b.is_sleeping())
+                            .count();
+                        let sleeping_bodies = total_bodies.saturating_sub(awake_bodies);
+                        let total_colliders = phys.colliders.len();
+                        let terrain_colliders = phys.chunk_colliders.len();
+                        let dynamic_colliders = total_colliders.saturating_sub(terrain_colliders);
+
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Bodies: {} ({} awake, {} asleep)",
+                                total_bodies, awake_bodies, sleeping_bodies
+                            ));
+                            ui.separator();
+                            ui.label(format!(
+                                "Colliders: {} ({} dynamic, {} terrain)",
+                                total_colliders, dynamic_colliders, terrain_colliders
+                            ));
+                        });
+
+                        ui.separator();
+                        ui.heading("Debug Visualization Overlays");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut state.show_rapier_colliders, "📦 Dynamic Colliders (Cyan)");
+                            ui.checkbox(&mut state.show_rapier_terrain, "⛰ Terrain Colliders (Orange)");
+                            ui.checkbox(&mut state.show_rapier_velocities, "⚡ Velocity Arrows (Yellow)");
+                            ui.checkbox(&mut state.show_rapier_aabbs, "🔲 Collider AABBs (Red)");
+                            ui.checkbox(&mut state.show_rapier_contacts, "💥 Contacts & Normals");
+                        });
+
+                        ui.separator();
+                        ui.heading("Physics Actions & Spawners");
+                        ui.horizontal(|ui| {
+                            let is_grab = matches!(state.tool_mode, DebugToolMode::PhysicsGrab);
+                            if ui.selectable_label(is_grab, "🧲 Grab Tool").clicked() {
+                                state.tool_mode = if is_grab {
+                                    DebugToolMode::PlayerTool
+                                } else {
+                                    DebugToolMode::PhysicsGrab
+                                };
+                            }
+                            if ui.button("📦 Crate (C)").clicked() {
+                                state.spawn_crate_requested = true;
+                            }
+                            if ui.button("🪨 Boulder (B)").clicked() {
+                                state.spawn_boulder_requested = true;
+                            }
+                            if ui.button("⏰ Wake All").clicked() {
+                                state.wake_all_bodies_requested = true;
+                            }
+                            if ui.button("💤 Sleep All").clicked() {
+                                state.sleep_all_bodies_requested = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let selected_prefab_name = prefab_configs
+                                .0
+                                .get(state.selected_prefab_idx)
+                                .map(|p| p.display_name.as_str())
+                                .unwrap_or("None");
+
+                            if ui
+                                .button(format!("🏗 Spawn Prefab Rigidbody ({})", selected_prefab_name))
+                                .clicked()
+                            {
+                                state.spawn_prefab_rigidbody_requested = true;
+                            }
+
+                            egui::ComboBox::from_id_salt("physics_prefab_select")
+                                .selected_text(selected_prefab_name)
+                                .show_ui(ui, |ui| {
+                                    for (idx, p) in prefab_configs.0.iter().enumerate() {
+                                        ui.selectable_value(&mut state.selected_prefab_idx, idx, &p.display_name);
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("🧹 Clear All Dynamic Bodies").clicked() {
+                                state.clear_all_bodies_requested = true;
+                            }
+                            if ui.button("🔄 Rebuild Terrain Colliders").clicked() {
+                                state.rebuild_terrain_colliders_requested = true;
+                            }
+                        });
+
+                        ui.separator();
+                        egui::CollapsingHeader::new(format!("Dynamic Rigidbodies ({})", total_bodies))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if total_bodies == 0 {
+                                    ui.small("No active dynamic rigidbodies. Press 'C' or 'B' to spawn crates or boulders.");
+                                } else {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(240.0)
+                                        .show(ui, |ui| {
+                                            let mut delete_target = None;
+                                            for (handle, rb) in phys.bodies.iter() {
+                                                let (idx, _gen) = handle.into_raw_parts();
+                                                let pos = from_rapier_vec(rb.translation());
+                                                let angle_deg = rb.rotation().angle().to_degrees();
+                                                let vel = from_rapier_vec(rb.linvel());
+                                                let speed = vel.length();
+                                                let is_sleeping = rb.is_sleeping();
+
+                                                ui.group(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        let status_badge = if is_sleeping {
+                                                            egui::RichText::new("SLEEP")
+                                                                .color(egui::Color32::from_rgb(140, 150, 170))
+                                                        } else {
+                                                            egui::RichText::new("AWAKE")
+                                                                .color(egui::Color32::from_rgb(60, 240, 120))
+                                                        };
+                                                        ui.strong(format!("#{}", idx));
+                                                        ui.label(status_badge);
+                                                        ui.label(format!("pos: ({:.1}, {:.1})", pos.x, pos.y));
+                                                        ui.label(format!("rot: {:.1}°", angle_deg));
+                                                        ui.label(format!(
+                                                            "vel: ({:.1}, {:.1}) [{:.1} px/s]",
+                                                            vel.x, vel.y, speed
+                                                        ));
+                                                        ui.label(format!("mass: {:.1}", rb.mass()));
+
+                                                        if ui.small_button("❌ Delete").clicked() {
+                                                            delete_target = Some(idx);
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                            if let Some(target) = delete_target {
+                                                state.delete_body_requested = Some(target);
+                                            }
+                                        });
+                                }
+                            });
+
+                        ui.separator();
+                        egui::CollapsingHeader::new(format!(
+                            "Active Terrain Chunk Colliders ({})",
+                            terrain_colliders
+                        ))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if terrain_colliders == 0 {
+                                ui.small("No static terrain chunk colliders currently active.");
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .max_height(180.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for &(cx, cy) in phys.chunk_colliders.keys() {
+                                                let min_x = cx * CHUNK_SIZE as i32;
+                                                let max_x = min_x + CHUNK_SIZE as i32;
+                                                let top_y = -(cy * CHUNK_SIZE as i32);
+                                                let bot_y = top_y - CHUNK_SIZE as i32;
+                                                ui.label(format!(
+                                                    "Chunk ({}, {}) [X:{}..{}, Y:{}..{}]",
+                                                    cx, cy, min_x, max_x, bot_y, top_y
+                                                ));
+                                            }
+                                        });
+                                    });
+                            }
+                        });
+                    } else {
+                        ui.label("RapierPhysics resource not loaded in active session.");
+                    }
                 }
             }
         });

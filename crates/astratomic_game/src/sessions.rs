@@ -53,6 +53,7 @@ pub fn world_session_plugin(session: &mut Session) {
         .install_plugin(AstratomicWorldgenPlugin)
         .install_plugin(AstratomicSimPlugin)
         .install_plugin(AstratomicPrefabsPlugin)
+        .install_plugin(AstratomicPhysicsPlugin)
         .install_plugin(AstratomicPlayerPlugin)
         .install_plugin(AstratomicRenderPlugin)
         .install_plugin(AstratomicDebugUiPlugin)

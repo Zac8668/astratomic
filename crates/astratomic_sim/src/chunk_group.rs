@@ -210,6 +210,7 @@ pub fn update_chunk_groups(
             for gx in -1..=1 {
                 if let Some(chunk) = chunks.get_mut(&(center_pos + ivec2(gx, gy))) {
                     let _ = std::sync::Arc::make_mut(&mut chunk.grid);
+                    chunk.collider_dirty = true;
                 }
             }
         }

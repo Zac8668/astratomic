@@ -666,9 +666,8 @@ pub fn step_chunk_simulation(
 
     new_dirty_rects.clear();
 
-    let mut pass_rng = fastrand::Rng::with_seed(
-        (world_seed as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ tick,
-    );
+    let mut pass_rng =
+        fastrand::Rng::with_seed((world_seed as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ tick);
     let mut x_passes = [0_i32, 1];
     let mut y_passes = [0_i32, 1];
     if pass_rng.bool() {
@@ -698,10 +697,7 @@ pub fn step_chunk_simulation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        chunk::Chunk,
-        world::global_to_chunk,
-    };
+    use crate::{chunk::Chunk, world::global_to_chunk};
 
     fn test_world() -> (ChunkWorld, DirtyRects, Materials) {
         let materials = Materials::default_builtin();
@@ -759,20 +755,47 @@ mod tests {
 
         // Neither sand nor gravel should have slid diagonally or melted flat
         for x in 10..=12 {
-            let a = chunk_world.get_atom(&global_to_chunk(ivec2(x, 19))).unwrap();
+            let a = chunk_world
+                .get_atom(&global_to_chunk(ivec2(x, 19)))
+                .unwrap();
             assert_eq!(a.material_id, 2, "sand should remain in place at ({x}, 19)");
             assert!(!a.is_free_falling(), "settled sand must stay asleep");
         }
         for x in 20..=22 {
-            let a = chunk_world.get_atom(&global_to_chunk(ivec2(x, 19))).unwrap();
-            assert_eq!(a.material_id, 4, "gravel should remain in place at ({x}, 19)");
+            let a = chunk_world
+                .get_atom(&global_to_chunk(ivec2(x, 19)))
+                .unwrap();
+            assert_eq!(
+                a.material_id, 4,
+                "gravel should remain in place at ({x}, 19)"
+            );
             assert!(!a.is_free_falling(), "settled gravel must stay asleep");
         }
         // Verify adjacent cells (9, 19) and (13, 19) are still void (no melting flat)
-        assert!(chunk_world.get_atom(&global_to_chunk(ivec2(9, 19))).unwrap().is_void());
-        assert!(chunk_world.get_atom(&global_to_chunk(ivec2(13, 19))).unwrap().is_void());
-        assert!(chunk_world.get_atom(&global_to_chunk(ivec2(19, 19))).unwrap().is_void());
-        assert!(chunk_world.get_atom(&global_to_chunk(ivec2(23, 19))).unwrap().is_void());
+        assert!(
+            chunk_world
+                .get_atom(&global_to_chunk(ivec2(9, 19)))
+                .unwrap()
+                .is_void()
+        );
+        assert!(
+            chunk_world
+                .get_atom(&global_to_chunk(ivec2(13, 19)))
+                .unwrap()
+                .is_void()
+        );
+        assert!(
+            chunk_world
+                .get_atom(&global_to_chunk(ivec2(19, 19)))
+                .unwrap()
+                .is_void()
+        );
+        assert!(
+            chunk_world
+                .get_atom(&global_to_chunk(ivec2(23, 19)))
+                .unwrap()
+                .is_void()
+        );
     }
 
     #[test]
@@ -800,7 +823,13 @@ mod tests {
 
         // Step once to verify stable
         step_chunk_simulation(&mut chunk_world, &mut dirty_rects, &materials);
-        assert_eq!(chunk_world.get_atom(&global_to_chunk(ivec2(15, 19))).unwrap().material_id, 2);
+        assert_eq!(
+            chunk_world
+                .get_atom(&global_to_chunk(ivec2(15, 19)))
+                .unwrap()
+                .material_id,
+            2
+        );
 
         // Undermine: dig out the supporting rock block at (15, 20)
         chunk_world.set_atom(global_to_chunk(ivec2(15, 20)), Atom::default());
@@ -813,7 +842,10 @@ mod tests {
 
         // The top sand atom must have collapsed downward
         assert!(
-            chunk_world.get_atom(&global_to_chunk(ivec2(15, 17))).unwrap().is_void(),
+            chunk_world
+                .get_atom(&global_to_chunk(ivec2(15, 17)))
+                .unwrap()
+                .is_void(),
             "top sand should have collapsed downward"
         );
         let fallen = (10..=20).any(|x| {
@@ -835,7 +867,13 @@ mod tests {
             chunk_world.paint_at_global(ivec2(i, i), 8, false, &materials, &mut dirty_rects);
             // Fill solid rock underneath
             for dy in 1..=5 {
-                chunk_world.paint_at_global(ivec2(i, i + dy), 8, false, &materials, &mut dirty_rects);
+                chunk_world.paint_at_global(
+                    ivec2(i, i + dy),
+                    8,
+                    false,
+                    &materials,
+                    &mut dirty_rects,
+                );
             }
         }
 
@@ -854,10 +892,7 @@ mod tests {
             let a = chunk_world.get_atom(&global_to_chunk(ivec2(x, x - 1)))?;
             (a.material_id == 4).then_some(ivec2(x, x - 1))
         });
-        assert!(
-            gravel_pos.is_some(),
-            "gravel must remain on the slope"
-        );
+        assert!(gravel_pos.is_some(), "gravel must remain on the slope");
         let pos = gravel_pos.unwrap();
         let atom = chunk_world.get_atom(&global_to_chunk(pos)).unwrap();
         assert!(

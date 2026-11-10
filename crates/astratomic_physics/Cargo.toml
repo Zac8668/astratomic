@@ -17,8 +17,11 @@ bones_ecs.workspace = true
 bones_asset.workspace = true
 bones_schema.workspace = true
 
+rapier2d.workspace = true
+
 bytemuck.workspace = true
 fastrand = "2.5"
+image = { version = "0.24", default-features = false, features = ["png"] }
 glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true
