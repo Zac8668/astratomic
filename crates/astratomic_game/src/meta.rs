@@ -9,5 +9,6 @@ use bones_framework::prelude::*;
 #[type_data(metadata_asset("game"))]
 pub struct GameMeta {
     pub player_atlas: Handle<Atlas>,
+    pub player_tool_atlas: Handle<Atlas>,
     pub materials: Handle<Materials>,
 }

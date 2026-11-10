@@ -1,0 +1,5 @@
+image: ./player_tool.png
+tile_size: [8, 6]
+columns: 1
+rows: 1
+

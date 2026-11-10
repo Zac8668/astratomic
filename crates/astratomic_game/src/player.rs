@@ -6,15 +6,18 @@ use std::collections::HashSet;
 use astratomic_physics::prelude::{
     ActorSimulationStamp, ActorState, KinematicActor, clear_actor_objects_system,
     find_surface_spawn_pos, kinematic_actor_movement_system, stamp_actor_objects_system,
-    world_cell_to_global_atom,
 };
 pub use astratomic_sim::consts::PLAYER_STEP_HEIGHT;
 use astratomic_sim::{
     atom::{Atom, Materials},
     consts::{
         FUEL_COMSUMPTON, FUEL_REGEN, JETPACK_FORCE, JETPACK_MAX, JUMP_MAG, PLAYER_LAYER, RUN_SPEED,
+        TOOL_DISTANCE, TOOL_RANGE,
     },
     geom_tools::Line,
+    particle::{
+        PARTICLE_IGNORE_WORLD_COLLISION, Particle, ParticleActorTargets, ParticlePool,
+    },
     world::{
         ChunkWorld, DirtyRects, SimulationSettings, global_to_chunk, update_dirty_rects,
         update_dirty_rects_3x3,
@@ -38,6 +41,15 @@ pub const BTN_INTERACT: u8 = 1 << 4;
 /// Maximum number of players in a match session.
 pub const MAX_PLAYERS: usize = 4;
 
+/// Maximum reach of the player tool in world units (atoms).
+pub const TOOL_MAX_REACH: f32 = 40.0;
+
+/// Maps a player slot `player_id` (`0..=3`) to its deterministic non-zero `target_actor_id` (`1..=4`).
+#[inline]
+pub const fn player_actor_id(player_id: u8) -> u8 {
+    player_id + 1
+}
+
 /// Default half-extents of a player's hitbox in atoms (`6x12` atom AABB).
 pub const PLAYER_HALF_SIZE: Vec2 = Vec2::new(4.0, 9.0);
 
@@ -57,6 +69,14 @@ pub struct Player;
 #[repr(C)]
 pub struct PlayerControlled {
     pub player_id: u8,
+}
+
+/// Marker component on an entity displaying a player's tool sprite.
+#[derive(HasSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct PlayerTool {
+    /// The player entity that owns this tool.
+    pub player: Entity,
 }
 
 /// Compact 12-byte network-ready player input state for a single simulation tick.
@@ -154,6 +174,7 @@ impl Default for LocalInputState {
 pub fn register_player_schemas() {
     Player::register_schema();
     PlayerControlled::register_schema();
+    PlayerTool::register_schema();
     PlayerInput::register_schema();
     MatchInputs::register_schema();
     LocalView::register_schema();
@@ -185,7 +206,9 @@ impl SessionPlugin for AstratomicPlayerPlugin {
             .add_system_to_stage(CoreStage::PreUpdate, gather_local_player_input_system)
             .add_system_to_stage(CoreStage::PreUpdate, player_controller_system)
             .add_system_to_stage(CoreStage::PreUpdate, kinematic_actor_movement_system)
+            .add_system_to_stage(CoreStage::PreUpdate, sync_actor_particle_targets_system)
             .add_system_to_stage(CoreStage::PreUpdate, player_world_action_system)
+            .add_system_to_stage(CoreStage::PreUpdate, player_throw_particles_system)
             .add_system_to_stage(CoreStage::PreUpdate, stamp_actor_objects_system)
             .add_system_to_stage(CoreStage::Update, clear_actor_objects_system)
             .add_system_to_stage(CoreStage::PostUpdate, update_local_view_camera_system)
@@ -205,6 +228,7 @@ pub fn setup_player_system(
     mut player_controlled: CompMut<PlayerControlled>,
     mut actors: CompMut<KinematicActor>,
     mut actor_states: CompMut<ActorState>,
+    mut player_tools: CompMut<PlayerTool>,
 ) {
     let spawn_pos = find_surface_spawn_pos(&chunk_world, 0.0, PLAYER_HALF_SIZE);
 
@@ -228,6 +252,13 @@ pub fn setup_player_system(
     transforms.insert(
         player_ent,
         Transform::from_translation(spawn_pos.extend(PLAYER_LAYER)),
+    );
+
+    let tool_ent = entities.create();
+    player_tools.insert(tool_ent, PlayerTool { player: player_ent });
+    transforms.insert(
+        tool_ent,
+        Transform::from_translation(Vec3::new(spawn_pos.x - 1.0, spawn_pos.y - 3.5, PLAYER_LAYER + 0.1)),
     );
 
     local_view.local_player_id = 0;
@@ -508,21 +539,159 @@ pub const fn hotbar_slot_to_material_id(slot: u8) -> u8 {
     }
 }
 
-/// Deterministic system where players mutate [`ChunkWorld`] (digging with `BTN_PRIMARY` or
-/// placing/shooting atoms with `BTN_SECONDARY` along `aim_dir`).
-///
-/// Players are collected and sorted by `player_id` (`0, 1, 2, 3`) before executing so world
-/// mutations are 100% deterministic across peers.
-pub fn player_world_action_system(
+/// PreUpdate system that populates [`ParticleActorTargets`] from active [`PlayerControlled`]
+/// [`KinematicActor`] positions and tool nozzles so homing particles navigate deterministically.
+pub fn sync_actor_particle_targets_system(
+    match_inputs: Option<Res<MatchInputs>>,
+    entities: Res<Entities>,
+    player_controlled: Comp<PlayerControlled>,
+    actors: Comp<KinematicActor>,
+    mut actor_targets: ResMut<ParticleActorTargets>,
+) {
+    actor_targets.clear();
+
+    let mut ordered_players: Vec<(u8, Entity)> = entities
+        .iter_with(&player_controlled)
+        .map(|(ent, ctrl)| (ctrl.player_id, ent))
+        .collect();
+    ordered_players.sort_by_key(|&(player_id, ent)| (player_id, ent));
+
+    for (player_id, ent) in ordered_players {
+        if let Some(actor) = actors.get(ent) {
+            // In ChunkWorld, +Y is downward, so actor.pos (Bones world +Y up) maps to [actor.pos.x, -actor.pos.y].
+            let mut center_pos = [actor.pos.x, -actor.pos.y];
+            if let Some(ref inputs) = match_inputs {
+                if let Some(input) = inputs.players.get(player_id as usize) {
+                    let aim = input.aim_vec2();
+                    if aim != Vec2::ZERO {
+                        let tool_slope = Vec2::new(aim.x, -aim.y).normalize();
+                        let tool_front = Vec2::new(actor.pos.x, -actor.pos.y) + tool_slope * 5.0;
+                        center_pos = [tool_front.x, tool_front.y];
+                    }
+                }
+            }
+            actor_targets.set_target(player_actor_id(player_id), center_pos, 6.0);
+        }
+    }
+}
+
+/// Deterministic system for throwing matter particles along player aim directions (`BTN_SECONDARY`).
+pub fn player_throw_particles_system(
     sim_settings: Option<Res<SimulationSettings>>,
     match_inputs: Res<MatchInputs>,
     materials: Res<Materials>,
     entities: Res<Entities>,
     player_controlled: Comp<PlayerControlled>,
     actors: Comp<KinematicActor>,
+    chunk_world: Res<ChunkWorld>,
+    mut particle_pool: Option<ResMut<ParticlePool>>,
+) {
+    if sim_settings
+        .as_ref()
+        .is_some_and(|s| s.paused && !s.step_once)
+    {
+        return;
+    }
+
+    let Some(ref mut pool) = particle_pool else {
+        return;
+    };
+
+    let mut ordered_players: Vec<(u8, Entity)> = entities
+        .iter_with(&player_controlled)
+        .map(|(ent, ctrl)| (ctrl.player_id, ent))
+        .collect();
+    ordered_players.sort_by_key(|&(player_id, ent)| (player_id, ent));
+
+    for (player_id, ent) in ordered_players {
+        let Some(input) = match_inputs.players.get(player_id as usize).copied() else {
+            continue;
+        };
+        let Some(actor) = actors.get(ent) else {
+            continue;
+        };
+
+        if !input.pressed(BTN_SECONDARY) {
+            continue;
+        }
+
+        let aim = input.aim_vec2();
+        if aim == Vec2::ZERO {
+            continue;
+        }
+
+        let tool_slope = Vec2::new(aim.x, -aim.y).normalize();
+        let bound_slope = Vec2::new(-tool_slope.y, tool_slope.x);
+        let player_center = Vec2::new(actor.pos.x, -actor.pos.y);
+        let tool_front = player_center + tool_slope * 5.0;
+        let new_tool_front = tool_front + tool_slope * 3.5;
+
+        let world_seed = chunk_world.seed as u64;
+        let current_tick = chunk_world.tick;
+        let mat_id = hotbar_slot_to_material_id(input.selected_slot);
+
+        let n = 4;
+        for i in 0..=n {
+            let seed = (world_seed ^ (current_tick << 16))
+                .wrapping_add((player_id as u64) << 48)
+                .wrapping_add((i as u64) << 32)
+                .wrapping_add(0x9E3779B97F4A7C15);
+            let mut rng = fastrand::Rng::with_seed(seed);
+
+            let rand_angle = rng.f32() * std::f32::consts::TAU;
+            let mut spawn_vec = new_tool_front - bound_slope * 2.0
+                + bound_slope * (4.0 * (i as f32 / n as f32))
+                + Vec2::new(rand_angle.cos(), rand_angle.sin()) * 0.8;
+
+            if tool_slope.y > 0.0 {
+                spawn_vec += tool_slope * (4.0 * tool_slope.y);
+            }
+
+            let chunk_pos = global_to_chunk(spawn_vec.as_ivec2());
+            if let Some(existing) = chunk_world.get_atom(&chunk_pos) {
+                if existing.is_air() || existing.is_object() {
+                    let angle_offset = rng.f32() * 0.4 - 0.2;
+                    let speed = 9.5 * (rng.f32() * 0.25 + 0.85);
+
+                    let cos_a = angle_offset.cos();
+                    let sin_a = angle_offset.sin();
+                    let vel = [
+                        (tool_slope.x * cos_a - tool_slope.y * sin_a) * speed,
+                        (tool_slope.x * sin_a + tool_slope.y * cos_a) * speed,
+                    ];
+
+                    let mut atom = Atom::new_with_rng(mat_id, &materials, &mut rng);
+                    atom.set_free_falling(true);
+                    atom.set_life_5bit(0);
+                    atom.vx = (vel[0] * 0.5).round().clamp(-6.0, 6.0) as i8;
+                    atom.vy = (vel[1] * 0.5).round().clamp(-6.0, 6.0) as i8;
+
+                    pool.push_particle(Particle::new(
+                        [spawn_vec.x, spawn_vec.y],
+                        vel,
+                        atom,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Deterministic system where players operate the matter manipulator tool (sucking atoms
+/// from terrain with `BTN_PRIMARY` along `aim_dir`).
+///
+/// Players are collected and sorted by `player_id` (`0, 1, 2, 3`) before executing so world
+/// mutations and particle spawning are 100% deterministic across peers.
+pub fn player_world_action_system(
+    sim_settings: Option<Res<SimulationSettings>>,
+    match_inputs: Res<MatchInputs>,
+    entities: Res<Entities>,
+    player_controlled: Comp<PlayerControlled>,
+    actors: Comp<KinematicActor>,
     mut states: CompMut<ActorState>,
     mut chunk_world: ResMut<ChunkWorld>,
     mut dirty_rects: ResMut<DirtyRects>,
+    mut particle_pool: Option<ResMut<ParticlePool>>,
 ) {
     if sim_settings
         .as_ref()
@@ -544,69 +713,82 @@ pub fn player_world_action_system(
         let Some(actor) = actors.get(ent) else {
             continue;
         };
-        let Some(state) = states.get_mut(ent) else {
+        let Some(_state) = states.get_mut(ent) else {
             continue;
         };
+
+        if !input.pressed(BTN_PRIMARY) {
+            continue;
+        }
 
         let aim = input.aim_vec2();
         if aim == Vec2::ZERO {
             continue;
         }
 
-        // Primary action: excavate atoms along a short beam in front of the player.
-        if input.pressed(BTN_PRIMARY) {
-            let start_world = actor.pos + aim * 4.0;
-            let end_world = actor.pos + aim * 24.0;
-            let start_cell = ivec2(start_world.x.floor() as i32, start_world.y.floor() as i32);
-            let end_cell = ivec2(end_world.x.floor() as i32, end_world.y.floor() as i32);
+        // In ChunkWorld, +Y is downward, so Bones world (+Y up) maps to (aim.x, -aim.y).
+        let tool_slope = Vec2::new(aim.x, -aim.y).normalize();
+        let bound_slope = Vec2::new(-tool_slope.y, tool_slope.x);
+        let player_center = Vec2::new(actor.pos.x, -actor.pos.y);
+        let tool_front = player_center + tool_slope * 5.0;
 
-            for cell in Line::points_inclusive(start_cell, end_cell) {
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let global = world_cell_to_global_atom(cell.x + dx, cell.y + dy);
-                        let chunk_pos = global_to_chunk(global);
-                        if let Some(atom) = chunk_world.get_atom(&chunk_pos)
-                            && !atom.is_void()
-                        {
-                            chunk_world.set_atom(chunk_pos, Atom::default());
-                            update_dirty_rects_3x3(&mut dirty_rects.current, chunk_pos);
-                            update_dirty_rects(&mut dirty_rects.render, chunk_pos);
-                        }
-                    }
+        let center_bound = tool_front + tool_slope * TOOL_DISTANCE;
+        let bound1 = (center_bound + bound_slope * TOOL_RANGE).as_ivec2();
+        let bound2 = (center_bound - bound_slope * TOOL_RANGE).as_ivec2();
+
+        let ray_start = (tool_front - tool_slope * 4.0).as_ivec2();
+        let tool_origin_check = tool_front - tool_slope * 6.0;
+        let min_dist_sq = 6.0 * 6.0;
+
+        for bound_vec in Line::new(bound1, bound2 - bound1) {
+            for vec in Line::new(ray_start, bound_vec - ray_start) {
+                if (vec.as_vec2() - tool_origin_check).length_squared() < min_dist_sq {
+                    continue;
                 }
-            }
-        }
 
-        // Secondary action: deposit/emit atoms of the selected hotbar slot along `aim_dir`.
-        if input.pressed(BTN_SECONDARY) && state.fire_cooldown_ticks == 0 {
-            let mat_id = hotbar_slot_to_material_id(input.selected_slot);
-            let spawn_world = actor.pos + aim * 10.0;
-            let base_wx = spawn_world.x.floor() as i32;
-            let base_wy = spawn_world.y.floor() as i32;
-            let launch_vx = (aim.x * 4.0).round().clamp(-10.0, 10.0) as i8;
-            // In `ChunkWorld`, `+vy` is downward, while `aim.y` is upward (`+Y` up).
-            let launch_vy = (-aim.y * 4.0).round().clamp(-10.0, 10.0) as i8;
-
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    let global = world_cell_to_global_atom(base_wx + ox, base_wy + oy);
-                    let chunk_pos = global_to_chunk(global);
-                    if let Some(existing) = chunk_world.get_atom(&chunk_pos)
-                        && existing.is_void()
-                    {
-                        let mut new_atom = Atom::new(mat_id, &materials);
-                        if new_atom.is_powder() || new_atom.is_liquid() {
-                            new_atom.vx = launch_vx;
-                            new_atom.vy = launch_vy;
-                            new_atom.set_moving(true);
-                        }
-                        chunk_world.set_atom(chunk_pos, new_atom);
+                let chunk_pos = global_to_chunk(vec);
+                if let Some(&atom) = chunk_world.get_atom(&chunk_pos) {
+                    if !atom.is_air() && !atom.is_object() {
+                        // Eject from ChunkWorld
+                        chunk_world.set_atom(chunk_pos, Atom::AIR);
                         update_dirty_rects_3x3(&mut dirty_rects.current, chunk_pos);
                         update_dirty_rects(&mut dirty_rects.render, chunk_pos);
+
+                        // Wake adjacent powder neighbors so terrain caves in naturally
+                        for (ndx, ndy) in [(0, -1), (-1, 0), (1, 0), (0, 1), (-1, -1), (1, -1)] {
+                            let n_cp = global_to_chunk(ivec2(vec.x + ndx, vec.y + ndy));
+                            if let Some(&neighbor) = chunk_world.get_atom(&n_cp) {
+                                if neighbor.is_powder() && !neighbor.is_free_falling() {
+                                    let mut waking = neighbor;
+                                    waking.set_free_falling(true);
+                                    waking.set_moving(true);
+                                    chunk_world.set_atom(n_cp, waking);
+                                }
+                            }
+                        }
+
+                        // Spawn homing particle targeting the player nozzle
+                        if let Some(ref mut pool) = particle_pool {
+                            let mut matter_atom = atom;
+                            matter_atom.set_free_falling(true);
+                            matter_atom.set_life_5bit(0);
+                            matter_atom.vx = 0;
+                            matter_atom.vy = 0;
+
+                            pool.push_particle(Particle::new_homing(
+                                [vec.x as f32 + 0.5, vec.y as f32 + 0.5],
+                                [0.0, 0.0],
+                                matter_atom,
+                                player_actor_id(player_id),
+                                PARTICLE_IGNORE_WORLD_COLLISION,
+                            ));
+                        }
+
+                        // Break the ray after first non-air atom hit (peels surface layer)
+                        break;
                     }
                 }
             }
-            state.fire_cooldown_ticks = 3;
         }
     }
 }
@@ -673,67 +855,134 @@ pub fn update_local_view_camera_system(
     }
 }
 
-/// Synchronizes `AtlasSprite` animation frames and facing direction for all player entities.
+/// Synchronizes `AtlasSprite` animation frames and facing direction for all player entities,
+/// as well as positioning, rotation, and flipping for the player's tool sprite.
 pub fn sync_player_visuals_system(
     time: Res<Time>,
     asset_server: Option<Res<AssetServer>>,
     match_inputs: Res<MatchInputs>,
-    entities: Res<Entities>,
+    mut entities: ResMut<Entities>,
     player_controlled: Comp<PlayerControlled>,
     actors: Comp<KinematicActor>,
     actor_states: Comp<ActorState>,
+    mut transforms: CompMut<Transform>,
     mut atlas_sprites: CompMut<AtlasSprite>,
+    mut player_tools: CompMut<PlayerTool>,
 ) {
-    let player_atlas_handle = asset_server.and_then(|server| {
-        let core_guard = server.store.core_pack.lock();
-        let pack = core_guard.as_ref()?;
-        let root_handle = pack.root.typed::<GameMeta>();
-        let meta = server.try_get(root_handle)?.ok()?;
-        Some(meta.player_atlas)
-    });
+    let (player_atlas_handle, tool_atlas_handle) = asset_server
+        .and_then(|server| {
+            let core_guard = server.store.core_pack.lock();
+            let pack = core_guard.as_ref()?;
+            let root_handle = pack.root.typed::<GameMeta>();
+            let meta = server.try_get(root_handle)?.ok()?;
+            Some((meta.player_atlas, meta.player_tool_atlas))
+        })
+        .unzip();
+
+    // Clean up orphaned tools whose player entity was destroyed
+    let dead_tools: Vec<Entity> = entities
+        .iter_with(&player_tools)
+        .filter(|(_t_ent, pt)| !entities.is_alive(pt.player))
+        .map(|(t_ent, _)| t_ent)
+        .collect();
+    for t_ent in dead_tools {
+        entities.kill(t_ent);
+    }
 
     let anim_tick = (time.elapsed_seconds() * 10.0) as u32;
 
-    for (ent, (ctrl, actor)) in entities.iter_with((&player_controlled, &actors)) {
+    let players_info: Vec<(Entity, u8, KinematicActor)> = entities
+        .iter_with((&player_controlled, &actors))
+        .map(|(ent, (ctrl, actor))| (ent, ctrl.player_id, *actor))
+        .collect();
+
+    for (ent, player_id, actor) in players_info {
         if atlas_sprites.get(ent).is_none()
             && let Some(atlas_handle) = player_atlas_handle
         {
             atlas_sprites.insert(ent, AtlasSprite::new(atlas_handle));
         }
 
-        let Some(sprite) = atlas_sprites.get_mut(ent) else {
-            continue;
-        };
-
         let input = match_inputs
             .players
-            .get(ctrl.player_id as usize)
+            .get(player_id as usize)
             .copied()
             .unwrap_or_default();
 
-        if input.aim_dir[0].abs() > 0.05 {
-            sprite.flip_x = input.aim_dir[0] < 0.0;
+        let aim = input.aim_vec2();
+        let facing_left = if aim.x.abs() > 0.05 {
+            aim.x < 0.0
         } else if actor.vel.x.abs() > 0.05 {
-            sprite.flip_x = actor.vel.x < 0.0;
-        }
-
-        let state = actor_states.get(ent);
-        let using_jetpack = !actor.grounded
-            && input.pressed(BTN_JETPACK)
-            && state.is_some_and(|s| s.jetpack_fuel > 0.0);
-
-        let (first_frame, last_frame): (u32, u32) = if using_jetpack {
-            (24, 26)
-        } else if !actor.grounded {
-            (16, 23)
-        } else if actor.vel.x.abs() > 0.1 {
-            (8, 11)
+            actor.vel.x < 0.0
         } else {
-            (0, 1)
+            atlas_sprites.get(ent).is_some_and(|s| s.flip_x)
         };
 
-        let span = (last_frame - first_frame + 1).max(1);
-        sprite.index = first_frame + (anim_tick % span);
+        if let Some(sprite) = atlas_sprites.get_mut(ent) {
+            sprite.flip_x = facing_left;
+
+            let state = actor_states.get(ent);
+            let using_jetpack = !actor.grounded
+                && input.pressed(BTN_JETPACK)
+                && state.is_some_and(|s| s.jetpack_fuel > 0.0);
+
+            let (first_frame, last_frame): (u32, u32) = if using_jetpack {
+                (24, 26)
+            } else if !actor.grounded {
+                (16, 23)
+            } else if actor.vel.x.abs() > 0.1 {
+                (8, 11)
+            } else {
+                (0, 1)
+            };
+
+            let span = (last_frame - first_frame + 1).max(1);
+            sprite.index = first_frame + (anim_tick % span);
+        }
+
+        // --- Tool Sprite Synchronization ---
+        let tool_ent = entities
+            .iter_with(&player_tools)
+            .find(|(_t_ent, pt)| pt.player == ent)
+            .map(|(t_ent, _)| t_ent)
+            .unwrap_or_else(|| {
+                let new_tool = entities.create();
+                player_tools.insert(new_tool, PlayerTool { player: ent });
+                transforms.insert(new_tool, Transform::default());
+                new_tool
+            });
+
+        if atlas_sprites.get(tool_ent).is_none()
+            && let Some(tool_atlas) = tool_atlas_handle
+        {
+            atlas_sprites.insert(tool_ent, AtlasSprite::new(tool_atlas));
+        }
+
+        let aim_norm = if aim != Vec2::ZERO {
+            aim.normalize()
+        } else {
+            Vec2::new(if facing_left { -1.0 } else { 1.0 }, 0.0)
+        };
+        let angle = aim_norm.y.atan2(aim_norm.x);
+        let flip_bool = angle.abs() > std::f32::consts::FRAC_PI_2;
+
+        if let Some(tool_sprite) = atlas_sprites.get_mut(tool_ent) {
+            tool_sprite.flip_y = flip_bool;
+        }
+
+        let player_trans = transforms
+            .get(ent)
+            .map(|t| t.translation)
+            .unwrap_or_else(|| actor.pos.extend(PLAYER_LAYER));
+        let offset_x = if flip_bool { 1.0 } else { -1.0 };
+        let offset_y = -3.5;
+        let tool_pivot = Vec2::new(player_trans.x + offset_x, player_trans.y + offset_y);
+        let tool_pos = tool_pivot + aim_norm * 3.0;
+
+        if let Some(tool_trans) = transforms.get_mut(tool_ent) {
+            tool_trans.translation = Vec3::new(tool_pos.x, tool_pos.y, PLAYER_LAYER + 0.1);
+            tool_trans.rotation = Quat::from_rotation_z(angle);
+        }
     }
 }
 
@@ -755,5 +1004,337 @@ mod tests {
         assert_eq!(bytes.len(), 12);
         let roundtrip: PlayerInput = *bytemuck::from_bytes(bytes);
         assert_eq!(roundtrip, input);
+    }
+
+    #[test]
+    fn test_tool_excavates_terrain_and_spawns_homing_particles() {
+        use astratomic_physics::prelude::world_cell_to_global_atom;
+        use astratomic_sim::chunk::Chunk;
+        use astratomic_sim::particle::{PARTICLE_FOLLOW_ACTOR, step_particle_simulation_with_targets};
+
+        register_player_schemas();
+        astratomic_sim::plugin::register_sim_schemas();
+        astratomic_physics::plugin::register_physics_schemas();
+
+        let session = Session::default();
+        session.world.init_resource::<MatchInputs>();
+        session.world.init_resource::<ChunkWorld>();
+        session.world.init_resource::<DirtyRects>();
+        session.world.init_resource::<Materials>();
+        session.world.init_resource::<ParticlePool>();
+        session.world.init_resource::<ParticleActorTargets>();
+
+        // Populate chunks
+        {
+            let mut world = session.world.resource_mut::<ChunkWorld>();
+            for cy in -2..=2 {
+                for cx in -2..=2 {
+                    world.add_chunk(ivec2(cx, cy), Chunk::default());
+                }
+            }
+            // Fill an obstacle patch of sand at wx in 8..=16, wy in -2..=2
+            let sand = Atom::with_state(2, astratomic_sim::atom::AtomState::Powder, [230, 197, 92, 255]);
+            for wx in 8..=16 {
+                for wy in -2..=2 {
+                    let cp = global_to_chunk(world_cell_to_global_atom(wx, wy));
+                    world.set_atom(cp, sand);
+                }
+            }
+        }
+
+        // Spawn player at (0.0, 0.0)
+        let _player_ent = {
+            let mut entities = session.world.resource_mut::<Entities>();
+            let mut players = session.world.component_mut::<Player>();
+            let mut player_controlled = session.world.component_mut::<PlayerControlled>();
+            let mut actors = session.world.component_mut::<KinematicActor>();
+            let mut states = session.world.component_mut::<ActorState>();
+
+            let ent = entities.create();
+            players.insert(ent, Player);
+            player_controlled.insert(ent, PlayerControlled { player_id: 0 });
+            actors.insert(ent, KinematicActor {
+                pos: Vec2::new(0.0, 0.0),
+                prev_pos: Vec2::new(0.0, 0.0),
+                vel: Vec2::ZERO,
+                half_size: PLAYER_HALF_SIZE,
+                step_height: PLAYER_STEP_HEIGHT,
+                weight: 70.0,
+                grounded: true,
+                ground_normal: Vec2::Y,
+            });
+            states.insert(ent, ActorState::default());
+            ent
+        };
+
+        // Aim player 0 right toward the sand with BTN_PRIMARY
+        {
+            let mut inputs = session.world.resource_mut::<MatchInputs>();
+            inputs.players[0] = PlayerInput {
+                move_x: 0,
+                move_y: 0,
+                buttons: BTN_PRIMARY,
+                selected_slot: 1, // radius 3
+                aim_dir: [1.0, 0.0],
+            };
+        }
+
+        // Sync targets and run action system
+        session.world.run_system(sync_actor_particle_targets_system, ());
+        session.world.run_system(player_world_action_system, ());
+
+        // Verify that homing matter particles were spawned into ParticlePool
+        {
+            let pool = session.world.resource::<ParticlePool>();
+            let matter_particles: Vec<_> = pool.particles().iter().filter(|p| p.atom.life_5bit() == 0).collect();
+            assert!(!matter_particles.is_empty(), "excavator must spawn homing matter particles");
+            for p in matter_particles {
+                assert_eq!(p.target_actor_id, player_actor_id(0));
+                assert_ne!(p.flags & PARTICLE_FOLLOW_ACTOR, 0);
+                assert_ne!(p.flags & PARTICLE_IGNORE_WORLD_COLLISION, 0);
+            }
+        }
+
+        let targets = {
+            let t = session.world.resource::<ParticleActorTargets>();
+            t.targets.clone()
+        };
+
+        for tick in 1..=60 {
+            let mut p_pool = session.world.resource_mut::<ParticlePool>();
+            let mut c_world = session.world.resource_mut::<ChunkWorld>();
+            let mut dirty = session.world.resource_mut::<DirtyRects>();
+            step_particle_simulation_with_targets(
+                &mut p_pool,
+                &mut c_world,
+                Some(&mut dirty),
+                tick,
+                &targets,
+            );
+            if p_pool.particles().iter().all(|p| p.atom.life_5bit() > 0) {
+                break;
+            }
+        }
+
+        let final_pool = session.world.resource::<ParticlePool>();
+        let remaining_matter = final_pool.particles().iter().filter(|p| p.atom.life_5bit() == 0).count();
+        assert_eq!(remaining_matter, 0, "all homing matter particles must despawn upon reaching the player");
+    }
+
+    #[test]
+    fn test_tool_throws_particles_and_settles() {
+        use astratomic_physics::prelude::world_cell_to_global_atom;
+        use astratomic_sim::chunk::Chunk;
+        use astratomic_sim::particle::step_particle_simulation;
+
+        register_player_schemas();
+        astratomic_sim::plugin::register_sim_schemas();
+        astratomic_physics::plugin::register_physics_schemas();
+
+        let session = Session::default();
+        session.world.init_resource::<MatchInputs>();
+        session.world.init_resource::<ChunkWorld>();
+        session.world.init_resource::<DirtyRects>();
+        session.world.init_resource::<Materials>();
+        session.world.init_resource::<ParticlePool>();
+        session.world.init_resource::<ParticleActorTargets>();
+
+        {
+            let mut world = session.world.resource_mut::<ChunkWorld>();
+            for cy in -1..=1 {
+                for cx in -1..=1 {
+                    world.add_chunk(ivec2(cx, cy), Chunk::default());
+                }
+            }
+            // Put a rock wall at wx = 20 (wy in -15..=15) in front of the player
+            // and a floor at wy = -10 (wx in 0..=30) to catch falling particles
+            let rock = Atom::with_state(8, astratomic_sim::atom::AtomState::Solid, [128, 128, 128, 255]);
+            for wy in -15..=15 {
+                let cp = global_to_chunk(world_cell_to_global_atom(20, wy));
+                world.set_atom(cp, rock);
+            }
+            for wx in 0..=30 {
+                let cp = global_to_chunk(world_cell_to_global_atom(wx, -10));
+                world.set_atom(cp, rock);
+            }
+        }
+
+        // Spawn player at (0.0, 0.0)
+        {
+            let mut entities = session.world.resource_mut::<Entities>();
+            let mut players = session.world.component_mut::<Player>();
+            let mut player_controlled = session.world.component_mut::<PlayerControlled>();
+            let mut actors = session.world.component_mut::<KinematicActor>();
+            let mut states = session.world.component_mut::<ActorState>();
+
+            let ent = entities.create();
+            players.insert(ent, Player);
+            player_controlled.insert(ent, PlayerControlled { player_id: 0 });
+            actors.insert(ent, KinematicActor {
+                pos: Vec2::new(0.0, 0.0),
+                prev_pos: Vec2::new(0.0, 0.0),
+                vel: Vec2::ZERO,
+                half_size: PLAYER_HALF_SIZE,
+                step_height: PLAYER_STEP_HEIGHT,
+                weight: 70.0,
+                grounded: true,
+                ground_normal: Vec2::Y,
+            });
+            states.insert(ent, ActorState::default());
+        }
+
+        // Aim right and press BTN_SECONDARY with slot 3 (Gravel, material_id = 4)
+        {
+            let mut inputs = session.world.resource_mut::<MatchInputs>();
+            inputs.players[0] = PlayerInput {
+                move_x: 0,
+                move_y: 0,
+                buttons: BTN_SECONDARY,
+                selected_slot: 3, // Gravel
+                aim_dir: [1.0, 0.0],
+            };
+        }
+
+        session.world.run_system(player_throw_particles_system, ());
+
+        // Verify that gravel particles were thrown into ParticlePool
+        {
+            let pool = session.world.resource::<ParticlePool>();
+            assert!(!pool.is_empty(), "secondary action must throw particles");
+            for p in pool.particles() {
+                assert_eq!(p.atom.material_id, 4);
+                assert_eq!(p.atom.life_5bit(), 0);
+                assert_eq!(p.target_actor_id, 0); // flying free
+                assert_eq!(p.flags, 0); // normal collision & gravity
+            }
+        }
+
+        // Simulate particles until they hit the rock wall/floor and reinsert
+        for tick in 1..=40 {
+            let mut pool = session.world.resource_mut::<ParticlePool>();
+            let mut world = session.world.resource_mut::<ChunkWorld>();
+            let mut dirty = session.world.resource_mut::<DirtyRects>();
+            step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), tick);
+            if pool.is_empty() {
+                break;
+            }
+        }
+
+        // Verify gravel settled onto the wall/floor
+        let world = session.world.resource::<ChunkWorld>();
+        let mut gravel_settled = 0;
+        for wx in 0..=30 {
+            for wy in -15..=15 {
+                let cp = global_to_chunk(world_cell_to_global_atom(wx, wy));
+                if let Some(atom) = world.get_atom(&cp)
+                    && atom.material_id == 4
+                {
+                    gravel_settled += 1;
+                }
+            }
+        }
+        assert!(gravel_settled > 0, "thrown particles must settle into terrain upon collision");
+    }
+
+    #[test]
+    fn test_tool_sprite_creation_and_sync() {
+        register_player_schemas();
+        astratomic_sim::plugin::register_sim_schemas();
+        astratomic_physics::plugin::register_physics_schemas();
+
+        let session = Session::default();
+        session.world.init_resource::<MatchInputs>();
+        session.world.init_resource::<Time>();
+
+        let player_ent = {
+            let mut entities = session.world.resource_mut::<Entities>();
+            let mut players = session.world.component_mut::<Player>();
+            let mut player_controlled = session.world.component_mut::<PlayerControlled>();
+            let mut actors = session.world.component_mut::<KinematicActor>();
+            let mut states = session.world.component_mut::<ActorState>();
+            let mut transforms = session.world.component_mut::<Transform>();
+
+            let ent = entities.create();
+            players.insert(ent, Player);
+            player_controlled.insert(ent, PlayerControlled { player_id: 0 });
+            actors.insert(ent, KinematicActor {
+                pos: Vec2::new(10.0, 20.0),
+                prev_pos: Vec2::new(10.0, 20.0),
+                vel: Vec2::ZERO,
+                half_size: PLAYER_HALF_SIZE,
+                step_height: PLAYER_STEP_HEIGHT,
+                weight: 70.0,
+                grounded: true,
+                ground_normal: Vec2::Y,
+            });
+            states.insert(ent, ActorState::default());
+            transforms.insert(ent, Transform::from_translation(Vec3::new(10.0, 20.0, PLAYER_LAYER)));
+            ent
+        };
+
+        // Aim right
+        {
+            let mut inputs = session.world.resource_mut::<MatchInputs>();
+            inputs.players[0] = PlayerInput {
+                move_x: 0,
+                move_y: 0,
+                buttons: 0,
+                selected_slot: 0,
+                aim_dir: [1.0, 0.0],
+            };
+        }
+
+        session.world.run_system(sync_player_visuals_system, ());
+
+        // Verify tool entity was spawned and positioned facing right
+        let tool_ent = {
+            let entities = session.world.resource::<Entities>();
+            let tools = session.world.component::<PlayerTool>();
+            let mut found = None;
+            for (t_ent, tool) in entities.iter_with(&tools) {
+                if tool.player == player_ent {
+                    found = Some(t_ent);
+                    break;
+                }
+            }
+            found.expect("sync_player_visuals_system must spawn PlayerTool entity")
+        };
+
+        {
+            let transforms = session.world.component::<Transform>();
+            let tool_trans = transforms.get(tool_ent).expect("tool must have Transform");
+            // facing right: offset_x = -1.0, aim_norm = (1.0, 0.0) -> pos.x = 10.0 - 1.0 + 3.0 = 12.0
+            assert!((tool_trans.translation.x - 12.0).abs() < 1e-4);
+            assert!((tool_trans.translation.y - (20.0 - 3.5)).abs() < 1e-4);
+            assert_eq!(tool_trans.translation.z, PLAYER_LAYER + 0.1);
+        }
+
+        // Aim left
+        {
+            let mut inputs = session.world.resource_mut::<MatchInputs>();
+            inputs.players[0].aim_dir = [-1.0, 0.0];
+        }
+
+        session.world.run_system(sync_player_visuals_system, ());
+
+        {
+            let transforms = session.world.component::<Transform>();
+            let tool_trans = transforms.get(tool_ent).unwrap();
+            // facing left: offset_x = 1.0, aim_norm = (-1.0, 0.0) -> pos.x = 10.0 + 1.0 - 3.0 = 8.0
+            assert!((tool_trans.translation.x - 8.0).abs() < 1e-4);
+        }
+
+        // Destroy player -> orphaned tool must be cleaned up
+        {
+            let mut entities = session.world.resource_mut::<Entities>();
+            entities.kill(player_ent);
+        }
+
+        session.world.run_system(sync_player_visuals_system, ());
+
+        {
+            let entities = session.world.resource::<Entities>();
+            assert!(!entities.is_alive(tool_ent), "orphaned tool must be despawned when player is destroyed");
+        }
     }
 }

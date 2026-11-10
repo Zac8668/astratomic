@@ -535,11 +535,7 @@ pub fn world_debug_tool_system(
                             atom.vx = 0;
                             atom.vy = 0;
                             let spawn_pos = [cursor_global.x as f32 + 0.5, cursor_global.y as f32 + 0.5];
-                            pool.push_particle(Particle {
-                                pos: spawn_pos,
-                                vel,
-                                atom,
-                            });
+                            pool.push_particle(Particle::new(spawn_pos, vel, atom));
                         }
                     }
                     ParticleSpawnType::Explosion => {
@@ -1333,11 +1329,7 @@ pub fn debug_ui_system(
                                                 );
                                                 atom.set_free_falling(true);
                                                 atom.set_life_5bit(0);
-                                                pool.push_particle(Particle {
-                                                    pos: spawn_pos,
-                                                    vel,
-                                                    atom,
-                                                });
+                                                pool.push_particle(Particle::new(spawn_pos, vel, atom));
                                             }
                                         }
                                         ParticleSpawnType::Explosion => {

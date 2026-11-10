@@ -3,7 +3,10 @@ use bones_framework::prelude::*;
 use crate::{
     atom::{Atom, AtomState, Material, Materials},
     chunk::Chunk,
-    particle::{Particle, ParticlePool, simulate_particles_system},
+    particle::{
+        Particle, ParticleActorTarget, ParticleActorTargets, ParticlePool,
+        simulate_particles_system,
+    },
     world::{
         ChunkGeneratorHook, ChunkPos, ChunkWorld, DirtyRects, MaterialsAssetTracker,
         SimulationSettings, URect, chunk_world_update_system, hot_reload_materials_system,
@@ -28,6 +31,8 @@ pub fn register_sim_schemas() {
     ChunkPos::register_schema();
     WorldIoWorker::register_schema();
     Particle::register_schema();
+    ParticleActorTarget::register_schema();
+    ParticleActorTargets::register_schema();
     ParticlePool::register_schema();
 }
 
@@ -54,6 +59,7 @@ impl SessionPlugin for AstratomicSimPlugin {
         session.world.init_resource::<MaterialsAssetTracker>();
         session.world.init_resource::<WorldIoWorker>();
         session.world.init_resource::<ParticlePool>();
+        session.world.init_resource::<ParticleActorTargets>();
 
         session
             .add_system_to_stage(CoreStage::Startup, setup_chunk_world_system)

@@ -1,3 +1,4 @@
 # Root metadata asset corresponding to `astratomic_game::meta::GameMeta`.
 player_atlas: ./player/player_sheet.atlas.yaml
+player_tool_atlas: ./player/player_tool.atlas.yaml
 materials: ./atoms.ron

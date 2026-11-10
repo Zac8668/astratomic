@@ -16,6 +16,17 @@ use crate::{
 /// Reuses `FLAG_SLIDE_LEFT` while in flight to indicate that an ephemeral FX particle bounces.
 pub const FLAG_PARTICLE_BOUNCE: u8 = 1 << 2;
 
+/// Particle actively steers and accelerates toward its target actor's center position each tick.
+pub const PARTICLE_FOLLOW_ACTOR: u8 = 1 << 0;
+
+/// Particle skips Bresenham/DDA ChunkWorld raycast collision and flies straight through solid terrain.
+pub const PARTICLE_IGNORE_WORLD_COLLISION: u8 = 1 << 1;
+
+/// Controls what happens when a following particle reaches its target actor's pickup radius:
+/// - If unset (`0`) -> Despawn: The particle is absorbed and removed from ParticlePool without writing to ChunkWorld.
+/// - If set (`1`) -> Re-insert: The particle places its Atom back into ChunkWorld at its current grid cell.
+pub const PARTICLE_REINSERT_ON_TOUCH: u8 = 1 << 2;
+
 /// Maximum number of active particles permitted in the particle pool.
 pub const MAX_PARTICLES: usize = 16_384;
 
@@ -28,7 +39,7 @@ pub const PARTICLE_AIR_DRAG: f32 = 0.995;
 /// Maximum velocity magnitude in pixels per tick.
 pub const MAX_PARTICLE_SPEED: f32 = 24.0;
 
-/// Compact 24-byte POD particle representation stored in a flat array.
+/// Compact 32-byte POD particle representation stored in a flat array.
 #[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable, HasSchema)]
 #[schema(opaque)]
 #[repr(C)]
@@ -39,9 +50,92 @@ pub struct Particle {
     pub vel: [f32; 2],
     /// The 8-byte [`Atom`] (preserves `material_id`, RGBA8 color, flags, and 5-bit life).
     pub atom: Atom,
+    /// Target actor ID (`0` = None, `1..=255` = actor/player ID).
+    pub target_actor_id: u8,
+    /// Behavior flags (`PARTICLE_FOLLOW_ACTOR`, `PARTICLE_IGNORE_WORLD_COLLISION`, `PARTICLE_REINSERT_ON_TOUCH`).
+    pub flags: u8,
+    /// Explicit padding to ensure 8-byte aligned block (total size 32 bytes) with zero compiler padding.
+    pub _padding: [u8; 6],
 }
 
-const _: [(); 24] = [(); std::mem::size_of::<Particle>()];
+const _: [(); 32] = [(); std::mem::size_of::<Particle>()];
+
+impl Particle {
+    /// Create a standard particle with default zero flags and target.
+    #[inline]
+    pub fn new(pos: [f32; 2], vel: [f32; 2], atom: Atom) -> Self {
+        Self {
+            pos,
+            vel,
+            atom,
+            target_actor_id: 0,
+            flags: 0,
+            _padding: [0; 6],
+        }
+    }
+
+    /// Create a particle targeting an actor with specific behavior flags.
+    #[inline]
+    pub fn new_homing(
+        pos: [f32; 2],
+        vel: [f32; 2],
+        atom: Atom,
+        target_actor_id: u8,
+        flags: u8,
+    ) -> Self {
+        Self {
+            pos,
+            vel,
+            atom,
+            target_actor_id,
+            flags: flags | PARTICLE_FOLLOW_ACTOR,
+            _padding: [0; 6],
+        }
+    }
+}
+
+/// Target actor center position and pickup radius for homing particles.
+#[derive(Clone, Copy, Debug, PartialEq, HasSchema, Default)]
+#[schema(opaque)]
+#[repr(C)]
+pub struct ParticleActorTarget {
+    /// Deterministic actor ID (e.g. `1..=4` for players).
+    pub actor_id: u8,
+    /// Center position in simulation pixel space (`+Y` down).
+    pub center_pos: [f32; 2],
+    /// Pickup contact radius in simulation pixels (e.g. `6.0`).
+    pub pickup_radius: f32,
+}
+
+/// Lookup resource mapping actor IDs to positions for homing particles.
+#[derive(Clone, Debug, PartialEq, HasSchema, Default)]
+#[schema(opaque)]
+pub struct ParticleActorTargets {
+    pub targets: Vec<ParticleActorTarget>,
+}
+
+impl ParticleActorTargets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_target(&mut self, actor_id: u8, center_pos: [f32; 2], pickup_radius: f32) {
+        if let Some(t) = self.targets.iter_mut().find(|t| t.actor_id == actor_id) {
+            t.center_pos = center_pos;
+            t.pickup_radius = pickup_radius;
+        } else {
+            self.targets.push(ParticleActorTarget {
+                actor_id,
+                center_pos,
+                pickup_radius,
+            });
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.targets.clear();
+    }
+}
 
 /// Unified pool resource handling both matter-carrying atoms and ephemeral FX particles.
 ///
@@ -97,12 +191,70 @@ impl ParticlePool {
         atom.vx = 0;
         atom.vy = 0;
 
-        self.push_particle(Particle {
-            pos: [gx as f32 + 0.5, gy as f32 + 0.5],
+        self.push_particle(Particle::new(
+            [gx as f32 + 0.5, gy as f32 + 0.5],
             vel,
             atom,
-        });
+        ));
         true
+    }
+
+    /// Eject a matter-carrying atom and spawn it as a homing particle targeting an actor.
+    pub fn eject_homing_from_grid(
+        &mut self,
+        world: &mut ChunkWorld,
+        gx: i32,
+        gy: i32,
+        vel: [f32; 2],
+        target_actor_id: u8,
+        flags: u8,
+    ) -> bool {
+        let chunk_pos = global_to_chunk(ivec2(gx, gy));
+        let Some(&existing) = world.get_atom(&chunk_pos) else {
+            return false;
+        };
+        if existing.is_air() || existing.is_object() {
+            return false;
+        }
+
+        let mut atom = existing;
+        if !world.set_atom(chunk_pos, Atom::AIR) {
+            return false;
+        }
+
+        atom.set_free_falling(true);
+        atom.set_life_5bit(0);
+        atom.vx = 0;
+        atom.vy = 0;
+
+        self.push_particle(Particle::new_homing(
+            [gx as f32 + 0.5, gy as f32 + 0.5],
+            vel,
+            atom,
+            target_actor_id,
+            flags,
+        ));
+        true
+    }
+
+    /// Eject a homing particle and mark dirty rects.
+    pub fn eject_homing_from_grid_dirty(
+        &mut self,
+        world: &mut ChunkWorld,
+        dirty_rects: &mut DirtyRects,
+        gx: i32,
+        gy: i32,
+        vel: [f32; 2],
+        target_actor_id: u8,
+        flags: u8,
+    ) -> bool {
+        let success = self.eject_homing_from_grid(world, gx, gy, vel, target_actor_id, flags);
+        if success {
+            let chunk_pos = global_to_chunk(ivec2(gx, gy));
+            update_dirty_rects_3x3(&mut dirty_rects.current, chunk_pos);
+            update_dirty_rects(&mut dirty_rects.render, chunk_pos);
+        }
+        success
     }
 
     /// Eject a matter-carrying atom and mark dirty rects.
@@ -140,7 +292,7 @@ impl ParticlePool {
             vy: 0,
         };
         atom.set_life_5bit(lifetime_ticks.clamp(1, 31));
-        self.push_particle(Particle { pos, vel, atom });
+        self.push_particle(Particle::new(pos, vel, atom));
     }
 
     /// Returns the number of active particles.
@@ -296,12 +448,13 @@ pub fn reinsert_particle_atom_with_dirty(
     false
 }
 
-/// Advance all particles in `pool` by one deterministic simulation tick.
-pub fn step_particle_simulation(
+/// Advance all particles in `pool` by one deterministic simulation tick, taking actor targets for homing.
+pub fn step_particle_simulation_with_targets(
     pool: &mut ParticlePool,
     world: &mut ChunkWorld,
     mut dirty_rects: Option<&mut DirtyRects>,
     current_tick: u64,
+    actor_targets: &[ParticleActorTarget],
 ) {
     if pool.active.is_empty() {
         return;
@@ -320,11 +473,53 @@ pub fn step_particle_simulation(
             p.atom.set_life_5bit(life - 1);
         }
 
-        // 2. Gravity & Air Drag
-        // In ChunkWorld, +Y is downward, so gravity increases vel[1].
-        p.vel[1] += PARTICLE_GRAVITY;
-        p.vel[0] *= PARTICLE_AIR_DRAG;
-        p.vel[1] *= PARTICLE_AIR_DRAG;
+        // 2. Homing vs Standard Physics
+        let is_homing_requested = (p.flags & PARTICLE_FOLLOW_ACTOR) != 0 && p.target_actor_id != 0;
+        let target = if is_homing_requested {
+            actor_targets.iter().find(|t| t.actor_id == p.target_actor_id)
+        } else {
+            None
+        };
+
+        if let Some(target) = target {
+            let target_pos = target.center_pos;
+            let pickup_radius = target.pickup_radius;
+
+            let to_target = [target_pos[0] - p.pos[0], target_pos[1] - p.pos[1]];
+            let dist_sq = to_target[0] * to_target[0] + to_target[1] * to_target[1];
+            let dist = dist_sq.sqrt();
+
+            // Actor Touch Check at current position:
+            if dist <= pickup_radius {
+                if (p.flags & PARTICLE_REINSERT_ON_TOUCH) != 0 {
+                    reinsert_particle_atom_with_dirty(
+                        world,
+                        dirty_rects.as_deref_mut(),
+                        p.pos[0].floor() as i32,
+                        p.pos[1].floor() as i32,
+                        p.vel,
+                        p.atom,
+                        current_tick,
+                    );
+                }
+                return false; // Despawn on touch or re-inserted into grid
+            }
+
+            // Homing Steering Physics matching original codebase (PartState::Follow):
+            // Directly steer toward target nozzle and smoothly accelerate
+            if dist > 1e-4 {
+                let dir = [to_target[0] / dist, to_target[1] / dist];
+                let cur_mag = (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt().clamp(0.0, 6.0);
+                let new_mag = cur_mag + 0.5;
+                p.vel[0] = dir[0] * new_mag;
+                p.vel[1] = dir[1] * new_mag;
+            }
+        } else {
+            // Standard Gravity & Air Drag (+Y is down):
+            p.vel[1] += PARTICLE_GRAVITY;
+            p.vel[0] *= PARTICLE_AIR_DRAG;
+            p.vel[1] *= PARTICLE_AIR_DRAG;
+        }
 
         let speed_sq = p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1];
         if speed_sq > MAX_PARTICLE_SPEED * MAX_PARTICLE_SPEED {
@@ -336,11 +531,36 @@ pub fn step_particle_simulation(
 
         let new_pos = [p.pos[0] + p.vel[0], p.pos[1] + p.vel[1]];
 
-        // 3. Signed Coordinate Conversion (`floor()`)
+        // Actor Touch Check at new_pos to prevent tunneling past the actor when moving fast:
+        if let Some(target) = target {
+            let new_to_target = [target.center_pos[0] - new_pos[0], target.center_pos[1] - new_pos[1]];
+            let new_dist_sq = new_to_target[0] * new_to_target[0] + new_to_target[1] * new_to_target[1];
+            if new_dist_sq <= target.pickup_radius * target.pickup_radius {
+                if (p.flags & PARTICLE_REINSERT_ON_TOUCH) != 0 {
+                    reinsert_particle_atom_with_dirty(
+                        world,
+                        dirty_rects.as_deref_mut(),
+                        new_pos[0].floor() as i32,
+                        new_pos[1].floor() as i32,
+                        p.vel,
+                        p.atom,
+                        current_tick,
+                    );
+                }
+                return false;
+            }
+        }
+
+        // 3. World Collision Check (PARTICLE_IGNORE_WORLD_COLLISION / Noclip):
+        if (p.flags & PARTICLE_IGNORE_WORLD_COLLISION) != 0 {
+            p.pos = new_pos;
+            return true;
+        }
+
+        // 4. Bresenham / Integer DDA Line Trace
         let start = (p.pos[0].floor() as i32, p.pos[1].floor() as i32);
         let end = (new_pos[0].floor() as i32, new_pos[1].floor() as i32);
 
-        // 4. Bresenham / Integer DDA Line Trace
         let mut last_free = start;
         for (cx, cy) in Bresenham::new(start, end) {
             let Some(atom) = world.get_atom_global(cx, cy) else {
@@ -387,18 +607,34 @@ pub fn step_particle_simulation(
     });
 }
 
+/// Advance all particles in `pool` by one deterministic simulation tick (without homing targets).
+pub fn step_particle_simulation(
+    pool: &mut ParticlePool,
+    world: &mut ChunkWorld,
+    dirty_rects: Option<&mut DirtyRects>,
+    current_tick: u64,
+) {
+    step_particle_simulation_with_targets(pool, world, dirty_rects, current_tick, &[]);
+}
+
 /// Bones ECS system advancing the [`ParticlePool`] simulation.
 pub fn simulate_particles_system(
     mut pool: ResMut<ParticlePool>,
     mut world: ResMut<ChunkWorld>,
     mut dirty_rects: Option<ResMut<DirtyRects>>,
+    actor_targets: Option<Res<ParticleActorTargets>>,
 ) {
     let current_tick = world.tick;
-    step_particle_simulation(
+    let targets = actor_targets
+        .as_ref()
+        .map(|t| t.targets.as_slice())
+        .unwrap_or(&[]);
+    step_particle_simulation_with_targets(
         &mut pool,
         &mut world,
         dirty_rects.as_deref_mut(),
         current_tick,
+        targets,
     );
 }
 
@@ -413,12 +649,12 @@ mod tests {
 
     #[test]
     fn test_particle_data_layout() {
-        assert_eq!(std::mem::size_of::<Particle>(), 24);
+        assert_eq!(std::mem::size_of::<Particle>(), 32);
         assert_eq!(std::mem::align_of::<Particle>(), 4);
 
         let zeroed = Particle::default();
-        let bytes: [u8; 24] = bytemuck::cast(zeroed);
-        assert_eq!(bytes, [0u8; 24]);
+        let bytes: [u8; 32] = bytemuck::cast(zeroed);
+        assert_eq!(bytes, [0u8; 32]);
 
         let p = Particle {
             pos: [12.5, -45.75],
@@ -430,8 +666,11 @@ mod tests {
                 vx: -3,
                 vy: 5,
             },
+            target_actor_id: 3,
+            flags: PARTICLE_FOLLOW_ACTOR | PARTICLE_IGNORE_WORLD_COLLISION,
+            _padding: [0; 6],
         };
-        let cast_bytes: [u8; 24] = bytemuck::cast(p);
+        let cast_bytes: [u8; 32] = bytemuck::cast(p);
         let back: Particle = bytemuck::cast(cast_bytes);
         assert_eq!(p, back);
     }
@@ -591,11 +830,7 @@ mod tests {
         // Spawn a real matter particle (sand, material_id = 2) at (10.5, 18.5) moving downward
         let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
         sand_atom.set_life_5bit(0); // 0 = real matter
-        pool.push_particle(Particle {
-            pos: [10.5, 18.5],
-            vel: [0.0, 2.0],
-            atom: sand_atom,
-        });
+        pool.push_particle(Particle::new([10.5, 18.5], [0.0, 2.0], sand_atom));
 
         step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 1);
         // Settled into grid, removed from pool
@@ -610,11 +845,7 @@ mod tests {
         // Multiple particles landing on the exact same spot:
         // Spawn 3 sand particles directed at (10.5, 18.5)
         for _ in 0..3 {
-            pool.push_particle(Particle {
-                pos: [10.5, 18.5],
-                vel: [0.0, 2.0],
-                atom: sand_atom,
-            });
+            pool.push_particle(Particle::new([10.5, 18.5], [0.0, 2.0], sand_atom));
         }
         step_particle_simulation(&mut pool, &mut world, Some(&mut dirty), 2);
         assert_eq!(pool.len(), 0);
@@ -676,5 +907,150 @@ mod tests {
             assert_eq!(pool.len(), 1);
             assert_eq!(pool.particles()[0].atom.life_5bit(), 3);
         }
+    }
+
+    #[test]
+    fn test_homing_particle_reaches_actor_and_despawns() {
+        let (mut world, mut dirty, _) = setup_test_world();
+        let mut pool = ParticlePool::new();
+
+        let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
+        sand_atom.set_life_5bit(0);
+
+        // Spawn particle at (10.0, 10.0) targeting actor 1 at (10.0, 30.0) with outward pop velocity
+        pool.push_particle(Particle {
+            pos: [10.0, 10.0],
+            vel: [-2.0, -1.0], // Initial outward pop velocity
+            atom: sand_atom,
+            target_actor_id: 1,
+            flags: PARTICLE_FOLLOW_ACTOR | PARTICLE_IGNORE_WORLD_COLLISION,
+            _padding: [0; 6],
+        });
+
+        let targets = vec![ParticleActorTarget {
+            actor_id: 1,
+            center_pos: [10.0, 30.0],
+            pickup_radius: 6.0,
+        }];
+
+        // Simulate ticks until particle reaches actor and despawns
+        for tick in 1..=100 {
+            step_particle_simulation_with_targets(
+                &mut pool,
+                &mut world,
+                Some(&mut dirty),
+                tick,
+                &targets,
+            );
+            if pool.is_empty() {
+                break;
+            }
+        }
+
+        // Particle must have reached actor and despawned without placing sand in the world
+        assert_eq!(pool.len(), 0);
+        let atom_at_target = world.get_atom_global(10, 30).unwrap();
+        assert!(atom_at_target.is_air());
+    }
+
+    #[test]
+    fn test_homing_particle_reinserts_into_world_on_touch() {
+        let (mut world, mut dirty, _) = setup_test_world();
+        let mut pool = ParticlePool::new();
+
+        let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
+        sand_atom.set_life_5bit(0);
+
+        // Spawn particle with PARTICLE_REINSERT_ON_TOUCH targeting actor 2
+        pool.push_particle(Particle {
+            pos: [10.0, 10.0],
+            vel: [0.0, 0.0],
+            atom: sand_atom,
+            target_actor_id: 2,
+            flags: PARTICLE_FOLLOW_ACTOR | PARTICLE_IGNORE_WORLD_COLLISION | PARTICLE_REINSERT_ON_TOUCH,
+            _padding: [0; 6],
+        });
+
+        let targets = vec![ParticleActorTarget {
+            actor_id: 2,
+            center_pos: [10.0, 25.0],
+            pickup_radius: 6.0,
+        }];
+
+        for tick in 1..=100 {
+            step_particle_simulation_with_targets(
+                &mut pool,
+                &mut world,
+                Some(&mut dirty),
+                tick,
+                &targets,
+            );
+            if pool.is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(pool.len(), 0);
+        // Sand must have re-inserted into ChunkWorld near the actor (y ~ 20..=30)
+        let mut found_sand = false;
+        for dy in -8..=8 {
+            for dx in -8..=8 {
+                if let Some(atom) = world.get_atom_global(10 + dx, 25 + dy) {
+                    if atom.material_id == 2 {
+                        found_sand = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_sand, "sand must be re-inserted into ChunkWorld when PARTICLE_REINSERT_ON_TOUCH is set");
+    }
+
+    #[test]
+    fn test_noclip_particle_flies_through_solid_terrain() {
+        let (mut world, mut dirty, materials) = setup_test_world();
+        let mut pool = ParticlePool::new();
+
+        // Solid rock wall from y = 10 to y = 20 at x in -5..=25
+        for x in -5..=25 {
+            for y in 10..=20 {
+                world.paint_at_global(ivec2(x, y), 8, false, &materials, &mut dirty);
+            }
+        }
+
+        let mut sand_atom = Atom::with_state(2, crate::atom::AtomState::Powder, [230, 197, 92, 255]);
+        sand_atom.set_life_5bit(0);
+
+        // Particle with PARTICLE_IGNORE_WORLD_COLLISION homing through the rock wall toward actor on the other side
+        pool.push_particle(Particle {
+            pos: [10.0, 5.0],
+            vel: [0.0, 2.0],
+            atom: sand_atom,
+            target_actor_id: 1,
+            flags: PARTICLE_FOLLOW_ACTOR | PARTICLE_IGNORE_WORLD_COLLISION,
+            _padding: [0; 6],
+        });
+
+        let targets = vec![ParticleActorTarget {
+            actor_id: 1,
+            center_pos: [10.0, 28.0],
+            pickup_radius: 4.0,
+        }];
+
+        // Advance 2 ticks: particle should be inside the solid wall without colliding
+        for tick in 1..=2 {
+            step_particle_simulation_with_targets(
+                &mut pool,
+                &mut world,
+                Some(&mut dirty),
+                tick,
+                &targets,
+            );
+        }
+
+        assert_eq!(pool.len(), 1);
+        let p = pool.particles()[0];
+        // Must have passed into/through rock wall without being blocked
+        assert!(p.pos[1] > 6.0);
     }
 }
