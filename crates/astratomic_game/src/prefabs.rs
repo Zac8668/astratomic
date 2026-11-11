@@ -856,20 +856,19 @@ pub fn pixel_body_from_prefab(
 ) -> PixelRigidBody {
     let w = config.mask.width() as usize;
     let h = config.mask.height() as usize;
-    let mut atoms = Vec::with_capacity(w * h);
+    let mut atoms = vec![Atom::AIR; w * h];
 
     let mask_raw = config.mask.as_raw();
     let image_raw = config.image.as_raw();
 
     for py in 0..h {
+        let body_y = h - 1 - py;
         for px in 0..w {
             let idx = (py * w + px) * 4;
             let id = if idx < mask_raw.len() { mask_raw[idx] } else { 0 };
             let alpha = if idx + 3 < mask_raw.len() { mask_raw[idx + 3] } else { 0 };
 
-            if alpha == 0 || id == 0 {
-                atoms.push(Atom::AIR);
-            } else {
+            if alpha != 0 && id != 0 {
                 let color = if idx + 3 < image_raw.len() {
                     [
                         image_raw[idx],
@@ -886,7 +885,7 @@ pub fn pixel_body_from_prefab(
                     .map(|m| m.default_state)
                     .unwrap_or_else(|| astratomic_sim::atom::AtomState::default_for_material_id(id));
 
-                atoms.push(Atom::with_state(id, state, color));
+                atoms[body_y * w + px] = Atom::with_state(id, state, color);
             }
         }
     }
@@ -894,13 +893,15 @@ pub fn pixel_body_from_prefab(
     PixelRigidBody {
         width: w as u16,
         height: h as u16,
-        atoms,
+        atoms: std::sync::Arc::new(atoms),
         prev_pos: spawn_pos,
         pos: spawn_pos,
         prev_angle: 0.0,
         angle: 0.0,
         image_handle: None,
+        render_cid: None,
         last_linvel: Vec2::ZERO,
+        prev_submerged_liquid_count: 0,
     }
 }
 

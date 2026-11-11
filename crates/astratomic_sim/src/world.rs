@@ -284,18 +284,39 @@ impl ChunkWorld {
     /// `Arc<ChunkGrid>` via `Arc::make_mut(&mut chunk.grid)`.
     pub fn get_mut_atom(&mut self, pos: ChunkPos) -> Option<&mut Atom> {
         let chunk = self.chunks.get_mut(&pos.chunk)?;
-        chunk.collider_dirty = true;
         let grid = Arc::make_mut(&mut chunk.grid);
         grid.atoms.get_mut(pos.atom.d1())
     }
 
+    /// Explicitly marks the Rapier static terrain collider for chunk at `chunk_coord` as dirty.
+    #[inline]
+    pub fn mark_collider_dirty(&mut self, chunk_coord: IVec2) {
+        if let Some(chunk) = self.chunks.get_mut(&chunk_coord) {
+            chunk.collider_dirty = true;
+        }
+    }
+
     /// Set the atom at `pos` using Copy-on-Write (`Arc::make_mut(&mut chunk.grid)`).
+    ///
+    /// Rapier static chunk colliders are ONLY marked dirty if adding or removing a hard [`AtomState::Solid`]
+    /// atom (powders and fluids never trigger static terrain polyline rebuilds).
     pub fn set_atom(&mut self, pos: ChunkPos, atom: Atom) -> bool {
-        let Some(slot) = self.get_mut_atom(pos) else {
-            return false;
+        let chunk = match self.chunks.get_mut(&pos.chunk) {
+            Some(c) => c,
+            None => return false,
         };
-        *slot = atom;
-        true
+        let idx = pos.atom.d1();
+        let old_atom = chunk.grid.atoms[idx];
+        if old_atom.is_solid() || atom.is_solid() {
+            chunk.collider_dirty = true;
+        }
+        let grid = Arc::make_mut(&mut chunk.grid);
+        if let Some(slot) = grid.atoms.get_mut(idx) {
+            *slot = atom;
+            true
+        } else {
+            false
+        }
     }
 
     /// Set the atom at global grid coordinates `(gx, gy)` using Copy-on-Write.

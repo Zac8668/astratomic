@@ -134,6 +134,49 @@ impl ParticleActorTargets {
     }
 }
 
+/// Simplified collision proxy for an active dynamic rigidbody used to prevent particles from solidifying inside it.
+#[derive(Clone, Debug, Default, HasSchema)]
+#[schema(opaque)]
+pub struct ParticleRigidBodyObstacle {
+    pub min_x: f32,
+    pub max_x: f32,
+    pub min_y: f32,
+    pub max_y: f32,
+    pub pos: [f32; 2],
+    pub sin_a: f32,
+    pub cos_a: f32,
+    pub width: u16,
+    pub height: u16,
+    pub atoms: Arc<Vec<Atom>>,
+}
+
+impl ParticleRigidBodyObstacle {
+    /// Tests if world cell `(wx, wy)` contains a solid atom in this rigidbody.
+    #[inline]
+    pub fn sample_rigidbody_at_world_cell(&self, wx: i32, wy: i32) -> Option<Atom> {
+        let dx = (wx as f32 + 0.5) - self.pos[0];
+        let dy = (wy as f32 + 0.5) - self.pos[1];
+        let half_w = self.width as f32 * 0.5;
+        let half_h = self.height as f32 * 0.5;
+        let local_x = (dx * self.cos_a + dy * self.sin_a + half_w).floor() as i32;
+        let local_y = (-dx * self.sin_a + dy * self.cos_a + half_h).floor() as i32;
+
+        if local_x >= 0 && local_x < self.width as i32 && local_y >= 0 && local_y < self.height as i32 {
+            let idx = (local_y as usize) * (self.width as usize) + (local_x as usize);
+            self.atoms.get(idx).copied()
+        } else {
+            None
+        }
+    }
+}
+
+/// Resource holding active dynamic rigidbody obstacle proxies for particle collision safety.
+#[derive(Clone, Debug, Default, HasSchema)]
+#[schema(opaque)]
+pub struct ParticleRigidBodyObstacles {
+    pub obstacles: Vec<ParticleRigidBodyObstacle>,
+}
+
 /// Unified pool resource handling both matter-carrying atoms and ephemeral FX particles.
 ///
 /// Backed by an `Arc<Vec<Particle>>` with Copy-on-Write semantics so rollback snapshots
@@ -266,6 +309,49 @@ impl ParticlePool {
             update_dirty_rects(&mut dirty_rects.render, chunk_pos);
         }
         success
+    }
+
+    /// Eject a matter-carrying atom from (orig_gx, orig_gy) in the grid, but spawn it
+    /// as a particle at (spawn_gx, spawn_gy), marking dirty rects if provided.
+    pub fn eject_atom_at_pos_dirty(
+        &mut self,
+        world: &mut ChunkWorld,
+        mut dirty_rects: Option<&mut DirtyRects>,
+        orig_gx: i32,
+        orig_gy: i32,
+        spawn_gx: i32,
+        spawn_gy: i32,
+        vel: [f32; 2],
+    ) -> bool {
+        let chunk_pos = global_to_chunk(ivec2(orig_gx, orig_gy));
+        let Some(&existing) = world.get_atom(&chunk_pos) else {
+            return false;
+        };
+        if existing.is_air() || existing.is_object() {
+            return false;
+        }
+
+        let mut atom = existing;
+        if !world.set_atom(chunk_pos, Atom::AIR) {
+            return false;
+        }
+
+        if let Some(ref mut dr) = dirty_rects {
+            update_dirty_rects_3x3(&mut dr.current, chunk_pos);
+            update_dirty_rects(&mut dr.render, chunk_pos);
+        }
+
+        atom.set_free_falling(true);
+        atom.set_life_5bit(0);
+        atom.vx = 0;
+        atom.vy = 0;
+
+        self.push_particle(Particle::new(
+            [spawn_gx as f32 + 0.5, spawn_gy as f32 + 0.5],
+            vel,
+            atom,
+        ));
+        true
     }
 
     /// Spawn an ephemeral visual effects particle.
@@ -451,9 +537,21 @@ pub fn reinsert_particle_atom_with_dirty(
 pub fn step_particle_simulation_with_targets(
     pool: &mut ParticlePool,
     world: &mut ChunkWorld,
+    dirty_rects: Option<&mut DirtyRects>,
+    current_tick: u64,
+    actor_targets: &[ParticleActorTarget],
+) {
+    step_particle_simulation_full(pool, world, dirty_rects, current_tick, actor_targets, &[]);
+}
+
+/// Advance all particles in `pool` by one deterministic simulation tick, taking actor targets and rigidbody obstacles.
+pub fn step_particle_simulation_full(
+    pool: &mut ParticlePool,
+    world: &mut ChunkWorld,
     mut dirty_rects: Option<&mut DirtyRects>,
     current_tick: u64,
     actor_targets: &[ParticleActorTarget],
+    rigidbody_obstacles: &[ParticleRigidBodyObstacle],
 ) {
     if pool.active.is_empty() {
         return;
@@ -578,6 +676,39 @@ pub fn step_particle_simulation_with_targets(
             if !atom.is_air() {
                 let (lx, ly) = last_free;
                 if !is_fx {
+                    // Safety net: check if (lx, ly) is currently covered by any PixelRigidBody
+                    let wx = lx;
+                    let wy = -ly - 1;
+                    let mut covered_by_rb = false;
+                    let mut deflect_dir = [0.0f32, 0.0f32];
+
+                    for obs in rigidbody_obstacles {
+                        let cx = wx as f32 + 0.5;
+                        let cy = wy as f32 + 0.5;
+                        if cx >= obs.min_x && cx <= obs.max_x && cy >= obs.min_y && cy <= obs.max_y {
+                            if let Some(rb_atom) = obs.sample_rigidbody_at_world_cell(wx, wy) {
+                                if !rb_atom.is_air() && !rb_atom.is_void() {
+                                    covered_by_rb = true;
+                                    let dx = cx - obs.pos[0];
+                                    let dy = cy - obs.pos[1];
+                                    let sx = if dx.abs() > 0.1 { dx.signum() } else { 1.0 };
+                                    let sy = if dy.abs() > 0.1 { dy.signum() } else { 1.0 };
+                                    deflect_dir = [sx, -sy]; // In sim coords, Y is inverted
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if covered_by_rb {
+                        // Push particle outward by 1.5 pixels and keep it flying for 1 more tick
+                        p.pos[0] += deflect_dir[0] * 1.5;
+                        p.pos[1] += deflect_dir[1] * 1.5;
+                        p.vel[0] = deflect_dir[0] * 2.5;
+                        p.vel[1] = deflect_dir[1] * 2.5;
+                        return true;
+                    }
+
                     // Case A: Real Matter -> re-insert into grid
                     reinsert_particle_atom_with_dirty(
                         world,
@@ -621,7 +752,7 @@ pub fn step_particle_simulation(
     dirty_rects: Option<&mut DirtyRects>,
     current_tick: u64,
 ) {
-    step_particle_simulation_with_targets(pool, world, dirty_rects, current_tick, &[]);
+    step_particle_simulation_full(pool, world, dirty_rects, current_tick, &[], &[]);
 }
 
 /// Bones ECS system advancing the [`ParticlePool`] simulation.
@@ -630,18 +761,24 @@ pub fn simulate_particles_system(
     mut world: ResMut<ChunkWorld>,
     mut dirty_rects: Option<ResMut<DirtyRects>>,
     actor_targets: Option<Res<ParticleActorTargets>>,
+    rigidbody_obstacles: Option<Res<ParticleRigidBodyObstacles>>,
 ) {
     let current_tick = world.tick;
     let targets = actor_targets
         .as_ref()
         .map(|t| t.targets.as_slice())
         .unwrap_or(&[]);
-    step_particle_simulation_with_targets(
+    let obstacles = rigidbody_obstacles
+        .as_ref()
+        .map(|o| o.obstacles.as_slice())
+        .unwrap_or(&[]);
+    step_particle_simulation_full(
         &mut pool,
         &mut world,
         dirty_rects.as_deref_mut(),
         current_tick,
         targets,
+        obstacles,
     );
 }
 

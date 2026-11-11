@@ -209,7 +209,6 @@ impl Chunk {
     /// Obtain a mutable reference to an atom by 1D index using Copy-on-Write (`Arc::make_mut`).
     #[inline]
     pub fn get_mut_atom(&mut self, index: usize) -> Option<&mut Atom> {
-        self.collider_dirty = true;
         Arc::make_mut(&mut self.grid).atoms.get_mut(index)
     }
 

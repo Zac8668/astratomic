@@ -5,8 +5,8 @@ use bones_framework::prelude::*;
 use crate::{
     actor::{ActorSimulationStamp, ActorState, KinematicActor},
     rigidbody::{
-        PhysicsBodyHandle, PixelRigidBody, RapierPhysics, particle_rigidbody_interaction_system,
-        step_rapier_physics_system,
+        ActorPhysicsHandle, PhysicsBodyHandle, PixelRigidBody, RapierPhysics,
+        particle_rigidbody_interaction_system,
     },
 };
 
@@ -17,7 +17,9 @@ pub fn register_physics_schemas() {
     ActorSimulationStamp::register_schema();
     RapierPhysics::register_schema();
     PhysicsBodyHandle::register_schema();
+    ActorPhysicsHandle::register_schema();
     PixelRigidBody::register_schema();
+    crate::rigidbody::RigidbodySimulationStamp::register_schema();
 }
 
 /// Bones plugin that registers [`KinematicActor`], [`RapierPhysics`], and [`PixelRigidBody`] schemas
@@ -35,9 +37,9 @@ impl SessionPlugin for AstratomicPhysicsPlugin {
     fn install(self, session: &mut Session) {
         register_physics_schemas();
         session.world.init_resource::<ActorSimulationStamp>();
+        session.world.init_resource::<crate::rigidbody::RigidbodySimulationStamp>();
         session.world.init_resource::<RapierPhysics>();
         session
-            .add_system_to_stage(CoreStage::PreUpdate, step_rapier_physics_system)
             .add_system_to_stage(CoreStage::Update, particle_rigidbody_interaction_system);
     }
 }

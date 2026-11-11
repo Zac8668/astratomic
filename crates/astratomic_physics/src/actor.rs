@@ -207,6 +207,207 @@ pub fn find_horizontal_hit_column(
     None
 }
 
+/// Collision proxy for an active dynamic [`PixelRigidBody`](crate::rigidbody::PixelRigidBody).
+#[derive(Clone, Copy, Debug)]
+pub struct ActiveRigidBodyCollider<'a> {
+    pub entity: Entity,
+    pub min_x: f32,
+    pub max_x: f32,
+    pub min_y: f32,
+    pub max_y: f32,
+    pub pos: Vec2,
+    pub sin_a: f32,
+    pub cos_a: f32,
+    pub body: &'a crate::rigidbody::PixelRigidBody,
+    pub linvel: Vec2,
+    pub angvel: f32,
+}
+
+/// Returns `true` if the world cell `(wx, wy)` contains a solid/powder atom in [`ChunkWorld`]
+/// or inside any overlapping [`PixelRigidBody`](crate::rigidbody::PixelRigidBody).
+#[inline]
+pub fn is_cell_solid_with_bodies(
+    chunk_world: &ChunkWorld,
+    bodies: &[ActiveRigidBodyCollider<'_>],
+    wx: i32,
+    wy: i32,
+) -> bool {
+    if is_world_cell_solid(chunk_world, wx, wy) {
+        return true;
+    }
+    let cx = wx as f32 + 0.5;
+    let cy = wy as f32 + 0.5;
+    for b in bodies {
+        if cx >= b.min_x && cx <= b.max_x && cy >= b.min_y && cy <= b.max_y {
+            if let Some(atom) = b.body.sample_rigidbody_at_world_cell(wx, wy, b.pos, b.sin_a, b.cos_a) {
+                if !atom.is_air() && !atom.is_void() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Tests whether any cell in `wx_start..=wx_end` and `wy_start..=wy_end` contains solid matter
+/// in [`ChunkWorld`] or active dynamic [`PixelRigidBody`](crate::rigidbody::PixelRigidBody) entities.
+#[inline]
+pub fn cells_have_solid_with_bodies(
+    chunk_world: &ChunkWorld,
+    bodies: &[ActiveRigidBodyCollider<'_>],
+    wx_start: i32,
+    wx_end: i32,
+    wy_start: i32,
+    wy_end: i32,
+) -> bool {
+    for wy in wy_start..=wy_end {
+        for wx in wx_start..=wx_end {
+            if is_cell_solid_with_bodies(chunk_world, bodies, wx, wy) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Finds the first solid obstacle column in `start_wx..=end_wx` when sweeping horizontally,
+/// checking both [`ChunkWorld`] and active dynamic [`PixelRigidBody`](crate::rigidbody::PixelRigidBody) entities.
+#[inline]
+pub fn find_horizontal_hit_column_with_bodies(
+    chunk_world: &ChunkWorld,
+    bodies: &[ActiveRigidBodyCollider<'_>],
+    start_wx: i32,
+    end_wx: i32,
+    wy_start: i32,
+    wy_end: i32,
+    moving_right: bool,
+) -> Option<i32> {
+    if moving_right {
+        for wx in start_wx..=end_wx {
+            for wy in wy_start..=wy_end {
+                if is_cell_solid_with_bodies(chunk_world, bodies, wx, wy) {
+                    return Some(wx);
+                }
+            }
+        }
+    } else {
+        for wx in (start_wx..=end_wx).rev() {
+            for wy in wy_start..=wy_end {
+                if is_cell_solid_with_bodies(chunk_world, bodies, wx, wy) {
+                    return Some(wx);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Samples beneath an actor's footprint `x0..=x1` at `foot_wy` to find an active
+/// [`PixelRigidBody`](crate::rigidbody::PixelRigidBody) being stood on.
+#[inline]
+pub fn sample_ground_rigidbody<'a>(
+    bodies: &'a [ActiveRigidBodyCollider<'a>],
+    x0: i32,
+    x1: i32,
+    foot_wy: i32,
+) -> Option<&'a ActiveRigidBodyCollider<'a>> {
+    for wy in [foot_wy, foot_wy - 1] {
+        let cy = wy as f32 + 0.5;
+        for wx in x0..=x1 {
+            let cx = wx as f32 + 0.5;
+            for b in bodies {
+                if cx >= b.min_x && cx <= b.max_x && cy >= b.min_y && cy <= b.max_y {
+                    if let Some(atom) = b.body.sample_rigidbody_at_world_cell(wx, wy, b.pos, b.sin_a, b.cos_a) {
+                        if !atom.is_air() && !atom.is_void() {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Sweeps an actor's position by `delta` against solid [`ChunkWorld`] terrain, preventing the actor
+/// from ever penetrating solid terrain when pushed by dynamic rigidbodies.
+pub fn sweep_actor_displacement(
+    chunk_world: &ChunkWorld,
+    actor: &mut KinematicActor,
+    delta: Vec2,
+) {
+    let half_w = actor.half_size.x.max(0.5);
+    let half_h = actor.half_size.y.max(0.5);
+
+    // Horizontal displacement
+    if delta.x.abs() > 0.0 {
+        let new_x = actor.pos.x + delta.x;
+        let y0 = (actor.pos.y - half_h + SKIN).floor() as i32;
+        let y1 = (actor.pos.y + half_h - SKIN).floor() as i32;
+        let (lead_wx_start, lead_wx_end) = if delta.x > 0.0 {
+            ((actor.pos.x + half_w - SKIN).floor() as i32, (new_x + half_w - SKIN).floor() as i32)
+        } else {
+            ((new_x - half_w + SKIN).floor() as i32, (actor.pos.x - half_w + SKIN).floor() as i32)
+        };
+        if let Some(hit_wx) = find_horizontal_hit_column(chunk_world, lead_wx_start, lead_wx_end, y0, y1, delta.x > 0.0) {
+            if delta.x > 0.0 {
+                actor.pos.x = (hit_wx as f32) - half_w - SKIN;
+            } else {
+                actor.pos.x = ((hit_wx + 1) as f32) + half_w + SKIN;
+            }
+            actor.vel.x = 0.0;
+        } else {
+            actor.pos.x = new_x;
+        }
+    }
+
+    // Vertical displacement
+    if delta.y.abs() > 0.0 {
+        let new_y = actor.pos.y + delta.y;
+        let x0 = (actor.pos.x - half_w + SKIN).floor() as i32;
+        let x1 = (actor.pos.x + half_w - SKIN).floor() as i32;
+        let (lead_wy_start, lead_wy_end) = if delta.y > 0.0 {
+            ((actor.pos.y + half_h - SKIN).floor() as i32, (new_y + half_h - SKIN).floor() as i32)
+        } else {
+            ((new_y - half_h + SKIN).floor() as i32, (actor.pos.y - half_h + SKIN).floor() as i32)
+        };
+        let mut hit_wy = None;
+        if delta.y > 0.0 {
+            for wy in lead_wy_start..=lead_wy_end {
+                for wx in x0..=x1 {
+                    if is_world_cell_solid(chunk_world, wx, wy) {
+                        hit_wy = Some(wy);
+                        break;
+                    }
+                }
+                if hit_wy.is_some() { break; }
+            }
+            if let Some(wy) = hit_wy {
+                actor.pos.y = (wy as f32) - half_h - SKIN;
+                actor.vel.y = 0.0;
+            } else {
+                actor.pos.y = new_y;
+            }
+        } else {
+            for wy in (lead_wy_start..=lead_wy_end).rev() {
+                for wx in x0..=x1 {
+                    if is_world_cell_solid(chunk_world, wx, wy) {
+                        hit_wy = Some(wy);
+                        break;
+                    }
+                }
+                if hit_wy.is_some() { break; }
+            }
+            if let Some(wy) = hit_wy {
+                actor.pos.y = ((wy + 1) as f32) + half_h + SKIN;
+                actor.vel.y = 0.0;
+            } else {
+                actor.pos.y = new_y;
+            }
+        }
+    }
+}
+
 /// Estimates the upward ground normal (`+Y` up) beneath an actor's feet by sampling surface
 /// heights across the left and right edges of the footprint.
 pub fn estimate_ground_normal(
@@ -936,10 +1137,34 @@ pub fn step_kinematic_actor(
 pub fn step_kinematic_actor_full(
     chunk_world: &mut ChunkWorld,
     actor: &mut KinematicActor,
+    state: Option<&mut ActorState>,
+    materials: Option<&Materials>,
+    particle_pool: Option<&mut ParticlePool>,
+    dirty_rects: Option<&mut DirtyRects>,
+) {
+    step_kinematic_actor_full_with_bodies(
+        chunk_world,
+        &[],
+        actor,
+        state,
+        materials,
+        particle_pool,
+        dirty_rects,
+        1.0 / 60.0,
+    );
+}
+
+/// Steps a single [`KinematicActor`] through [`ChunkWorld`] and active dynamic [`PixelRigidBody`](crate::rigidbody::PixelRigidBody)
+/// colliders, supporting 3px step-up over both terrain and rigidbodies, and smooth floor velocity inheritance.
+pub fn step_kinematic_actor_full_with_bodies(
+    chunk_world: &mut ChunkWorld,
+    bodies: &[ActiveRigidBodyCollider<'_>],
+    actor: &mut KinematicActor,
     mut state: Option<&mut ActorState>,
     materials: Option<&Materials>,
     mut particle_pool: Option<&mut ParticlePool>,
     mut dirty_rects: Option<&mut DirtyRects>,
+    dt: f32,
 ) {
     // Save `pos` into `prev_pos` at the start of every tick for render interpolation & Verlet physics.
     actor.prev_pos = actor.pos;
@@ -986,11 +1211,11 @@ pub fn step_kinematic_actor_full(
             };
 
             let upper_clear =
-                !cells_have_solid(chunk_world, lead_wx_start, lead_wx_end, upper_y0, upper_y1);
+                !cells_have_solid_with_bodies(chunk_world, bodies, lead_wx_start, lead_wx_end, upper_y0, upper_y1);
 
             if upper_clear {
                 let feet_has_solid = step_height > 0
-                    && cells_have_solid(chunk_world, lead_wx_start, lead_wx_end, feet_y0, feet_y1);
+                    && cells_have_solid_with_bodies(chunk_world, bodies, lead_wx_start, lead_wx_end, feet_y0, feet_y1);
 
                 if !feet_has_solid {
                     actor.pos.x = new_x;
@@ -1002,8 +1227,9 @@ pub fn step_kinematic_actor_full(
                         let candidate_y = actor.pos.y + h as f32;
                         let cand_bottom = (candidate_y - half_h + SKIN).floor() as i32;
                         let cand_top = (candidate_y + half_h - SKIN).floor() as i32;
-                        if !cells_have_solid(
+                        if !cells_have_solid_with_bodies(
                             chunk_world,
+                            bodies,
                             lead_wx_start,
                             lead_wx_end,
                             cand_bottom,
@@ -1019,14 +1245,17 @@ pub fn step_kinematic_actor_full(
                     if !stepped_up {
                         let full_y0 = feet_y0;
                         let full_y1 = upper_y1;
-                        if let Some(hit_wx) = find_horizontal_hit_column(
+                        if let Some(hit_wx) = find_horizontal_hit_column_with_bodies(
                             chunk_world,
+                            bodies,
                             lead_wx_start,
                             lead_wx_end,
                             full_y0,
                             full_y1,
                             moving_right,
                         ) {
+                            let hit_terrain = (full_y0..=full_y1)
+                                .any(|wy| is_world_cell_solid(chunk_world, hit_wx, wy));
                             if moving_right {
                                 let snapped = (hit_wx as f32) - half_w - SKIN;
                                 actor.pos.x = snapped.max(actor.pos.x);
@@ -1034,33 +1263,38 @@ pub fn step_kinematic_actor_full(
                                 let snapped = ((hit_wx + 1) as f32) + half_w + SKIN;
                                 actor.pos.x = snapped.min(actor.pos.x);
                             }
-                            handle_horizontal_impact(
-                                chunk_world,
-                                actor,
-                                hit_wx,
-                                full_y0,
-                                full_y1,
-                                initial_vel.x,
-                                materials,
-                                particle_pool.as_deref_mut(),
-                                dirty_rects.as_deref_mut(),
-                            );
+                            if hit_terrain {
+                                handle_horizontal_impact(
+                                    chunk_world,
+                                    actor,
+                                    hit_wx,
+                                    full_y0,
+                                    full_y1,
+                                    initial_vel.x,
+                                    materials,
+                                    particle_pool.as_deref_mut(),
+                                    dirty_rects.as_deref_mut(),
+                                );
+                                actor.vel.x = 0.0;
+                            }
                         }
-                        actor.vel.x = 0.0;
                         break;
                     }
                 }
             } else {
                 let full_y0 = feet_y0;
                 let full_y1 = upper_y1;
-                if let Some(hit_wx) = find_horizontal_hit_column(
+                if let Some(hit_wx) = find_horizontal_hit_column_with_bodies(
                     chunk_world,
+                    bodies,
                     lead_wx_start,
                     lead_wx_end,
                     full_y0,
                     full_y1,
                     moving_right,
                 ) {
+                    let hit_terrain = (full_y0..=full_y1)
+                        .any(|wy| is_world_cell_solid(chunk_world, hit_wx, wy));
                     if moving_right {
                         let snapped = (hit_wx as f32) - half_w - SKIN;
                         actor.pos.x = snapped.max(actor.pos.x);
@@ -1068,19 +1302,21 @@ pub fn step_kinematic_actor_full(
                         let snapped = ((hit_wx + 1) as f32) + half_w + SKIN;
                         actor.pos.x = snapped.min(actor.pos.x);
                     }
-                    handle_horizontal_impact(
-                        chunk_world,
-                        actor,
-                        hit_wx,
-                        full_y0,
-                        full_y1,
-                        initial_vel.x,
-                        materials,
-                        particle_pool.as_deref_mut(),
-                        dirty_rects.as_deref_mut(),
-                    );
+                    if hit_terrain {
+                        handle_horizontal_impact(
+                            chunk_world,
+                            actor,
+                            hit_wx,
+                            full_y0,
+                            full_y1,
+                            initial_vel.x,
+                            materials,
+                            particle_pool.as_deref_mut(),
+                            dirty_rects.as_deref_mut(),
+                        );
+                        actor.vel.x = 0.0;
+                    }
                 }
-                actor.vel.x = 0.0;
                 break;
             }
         }
@@ -1111,7 +1347,7 @@ pub fn step_kinematic_actor_full(
                 let mut hit_wy = None;
                 'search_down: for wy in (lead_wy_start..=lead_wy_end).rev() {
                     for wx in x0..=x1 {
-                        if is_world_cell_solid(chunk_world, wx, wy) {
+                        if is_cell_solid_with_bodies(chunk_world, bodies, wx, wy) {
                             hit_wy = Some(wy);
                             break 'search_down;
                         }
@@ -1150,7 +1386,7 @@ pub fn step_kinematic_actor_full(
                 let mut hit_wy = None;
                 'search_up: for wy in lead_wy_start..=lead_wy_end {
                     for wx in x0..=x1 {
-                        if is_world_cell_solid(chunk_world, wx, wy) {
+                        if is_cell_solid_with_bodies(chunk_world, bodies, wx, wy) {
                             hit_wy = Some(wy);
                             break 'search_up;
                         }
@@ -1182,6 +1418,17 @@ pub fn step_kinematic_actor_full(
             probe_top,
         ) {
             hit_floor = true;
+        } else {
+            let py0 = probe_bottom.floor() as i32;
+            let py1 = probe_top.floor() as i32;
+            'probe_bodies: for pwy in py0..=py1 {
+                for pwx in x0..=x1 {
+                    if is_cell_solid_with_bodies(chunk_world, bodies, pwx, pwy) {
+                        hit_floor = true;
+                        break 'probe_bodies;
+                    }
+                }
+            }
         }
     }
 
@@ -1191,6 +1438,17 @@ pub fn step_kinematic_actor_full(
             estimate_ground_normal(chunk_world, actor.pos, actor.half_size, step_height);
         if let Some(ref mut st) = state {
             st.coyote_ticks = COYOTE_TIME_TICKS;
+        }
+
+        // Step C: If standing on top of an active PixelRigidBody, inherit its surface point velocity
+        let foot_wy = (actor.pos.y - half_h).floor() as i32;
+        if let Some(rb_col) = sample_ground_rigidbody(bodies, x0, x1, foot_wy) {
+            let foot_pos = Vec2::new(actor.pos.x, actor.pos.y - half_h);
+            let r = foot_pos - rb_col.pos;
+            let v_rot = Vec2::new(-rb_col.angvel * r.y, rb_col.angvel * r.x);
+            let surface_vel = rb_col.linvel + v_rot;
+            let floor_vel = surface_vel * dt;
+            sweep_actor_displacement(chunk_world, actor, floor_vel);
         }
     } else {
         actor.grounded = false;
@@ -1299,10 +1557,12 @@ pub fn kinematic_actor_movement_system(
     materials: Option<Res<Materials>>,
     mut particle_pool: Option<ResMut<ParticlePool>>,
     mut dirty_rects: Option<ResMut<DirtyRects>>,
-    mut rapier_physics: Option<ResMut<crate::rigidbody::RapierPhysics>>,
+    rapier_physics: Option<Res<crate::rigidbody::RapierPhysics>>,
     entities: Res<Entities>,
     mut actors: CompMut<KinematicActor>,
     mut states: CompMut<ActorState>,
+    pixel_bodies: Comp<crate::rigidbody::PixelRigidBody>,
+    handles: Comp<crate::rigidbody::PhysicsBodyHandle>,
 ) {
     if sim_settings
         .as_ref()
@@ -1311,10 +1571,39 @@ pub fn kinematic_actor_movement_system(
         return;
     }
 
-    let obstacles = rapier_physics
-        .as_ref()
-        .map(|p| crate::rigidbody::collect_dynamic_obstacles(p))
-        .unwrap_or_default();
+    let dt = rapier_physics.as_ref().map(|p| p.integration_parameters.dt).unwrap_or(1.0 / 60.0);
+
+    let mut active_bodies = Vec::new();
+    if let Some(ref physics) = rapier_physics {
+        let mut ordered_bodies: Vec<Entity> = entities.iter_with(&pixel_bodies).map(|(e, _)| e).collect();
+        ordered_bodies.sort_unstable();
+        for b_ent in ordered_bodies {
+            if let Some(body) = pixel_bodies.get(b_ent)
+                && let Some(handle) = handles.get(b_ent)
+            {
+                if let Some(rb) = physics.bodies.get(handle.handle()) {
+                    let half_w = body.width as f32 * 0.5;
+                    let half_h = body.height as f32 * 0.5;
+                    let (sin_a, cos_a) = body.angle.sin_cos();
+                    let x_extent = half_w * cos_a.abs() + half_h * sin_a.abs();
+                    let y_extent = half_w * sin_a.abs() + half_h * cos_a.abs();
+                    active_bodies.push(ActiveRigidBodyCollider {
+                        entity: b_ent,
+                        min_x: body.pos.x - x_extent,
+                        max_x: body.pos.x + x_extent,
+                        min_y: body.pos.y - y_extent,
+                        max_y: body.pos.y + y_extent,
+                        pos: body.pos,
+                        sin_a,
+                        cos_a,
+                        body,
+                        linvel: crate::rigidbody::from_rapier_vec(rb.linvel()),
+                        angvel: rb.angvel(),
+                    });
+                }
+            }
+        }
+    }
 
     let mut actor_entities: Vec<Entity> = entities.iter_with(&actors).map(|(ent, _)| ent).collect();
     actor_entities.sort_unstable();
@@ -1324,34 +1613,17 @@ pub fn kinematic_actor_movement_system(
             continue;
         };
         let state = states.get_mut(ent);
-        let initial_vel = actor.vel;
-        let prev_pos = actor.prev_pos;
 
-        step_kinematic_actor_full(
+        step_kinematic_actor_full_with_bodies(
             &mut chunk_world,
+            &active_bodies,
             actor,
             state,
             materials.as_deref(),
             particle_pool.as_deref_mut(),
             dirty_rects.as_deref_mut(),
+            dt,
         );
-
-        if let Some(ref mut physics) = rapier_physics
-            && !obstacles.is_empty()
-        {
-            crate::rigidbody::resolve_actor_dynamic_obstacles(
-                &mut actor.pos,
-                prev_pos,
-                &mut actor.vel,
-                &mut actor.grounded,
-                actor.half_size,
-                actor.step_height,
-                actor.weight,
-                initial_vel,
-                &obstacles,
-                physics,
-            );
-        }
     }
 }
 

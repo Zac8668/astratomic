@@ -134,7 +134,7 @@ impl Materials {
             // 1: Object
             Material {
                 default_state: AtomState::Object,
-                weight: 10.0,
+                weight: 1.0,
                 ..Default::default()
             },
             // 2: Sand
@@ -164,13 +164,13 @@ impl Materials {
                 flow: 1,
                 damage: 15.0,
                 default_state: AtomState::Liquid,
-                weight: 2.5,
+                weight: 2.2,
                 ..Default::default()
             },
             // 6: Grass
             Material {
                 default_state: AtomState::Solid,
-                weight: 1.0,
+                weight: 0.5,
                 ..Default::default()
             },
             // 7: Dirt
@@ -208,7 +208,7 @@ impl Materials {
             // 12: Wood
             Material {
                 default_state: AtomState::Solid,
-                weight: 0.7,
+                weight: 0.5,
                 ..Default::default()
             },
             // 13: Coal
@@ -220,7 +220,7 @@ impl Materials {
             // 14: Iron Ore
             Material {
                 default_state: AtomState::Solid,
-                weight: 5.0,
+                weight: 4.0,
                 ..Default::default()
             },
             // 15: Gold Ore

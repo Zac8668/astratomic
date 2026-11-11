@@ -5,7 +5,7 @@ use crate::{
     chunk::Chunk,
     particle::{
         Particle, ParticleActorTarget, ParticleActorTargets, ParticlePool,
-        simulate_particles_system,
+        ParticleRigidBodyObstacle, ParticleRigidBodyObstacles, simulate_particles_system,
     },
     world::{
         ChunkGeneratorHook, ChunkPos, ChunkWorld, DirtyRects, MaterialsAssetTracker,
@@ -33,6 +33,8 @@ pub fn register_sim_schemas() {
     Particle::register_schema();
     ParticleActorTarget::register_schema();
     ParticleActorTargets::register_schema();
+    ParticleRigidBodyObstacle::register_schema();
+    ParticleRigidBodyObstacles::register_schema();
     ParticlePool::register_schema();
 }
 
@@ -60,6 +62,7 @@ impl SessionPlugin for AstratomicSimPlugin {
         session.world.init_resource::<WorldIoWorker>();
         session.world.init_resource::<ParticlePool>();
         session.world.init_resource::<ParticleActorTargets>();
+        session.world.init_resource::<ParticleRigidBodyObstacles>();
 
         session
             .add_system_to_stage(CoreStage::Startup, setup_chunk_world_system)

@@ -5,7 +5,8 @@ use std::collections::HashSet;
 
 use astratomic_physics::prelude::{
     ActorSimulationStamp, ActorState, KinematicActor, clear_actor_objects_system,
-    find_surface_spawn_pos, kinematic_actor_movement_system, stamp_actor_objects_system,
+    clear_rigidbody_objects_system, find_surface_spawn_pos, kinematic_actor_movement_system,
+    stamp_actor_objects_system, stamp_rigidbody_objects_system, step_rapier_physics_system,
 };
 pub use astratomic_sim::consts::PLAYER_STEP_HEIGHT;
 use astratomic_sim::{
@@ -42,6 +43,9 @@ pub const MAX_PLAYERS: usize = 4;
 /// Maximum reach of the player tool in world units (atoms).
 pub const TOOL_MAX_REACH: f32 = 40.0;
 
+/// Horizontal visual and firing offset of the player tool relative to the actor center.
+pub const PLAYER_TOOL_OFFSET_X: f32 = 5.0;
+
 /// Maps a player slot `player_id` (`0..=3`) to its deterministic non-zero `target_actor_id` (`1..=4`).
 #[inline]
 pub const fn player_actor_id(player_id: u8) -> u8 {
@@ -49,7 +53,7 @@ pub const fn player_actor_id(player_id: u8) -> u8 {
 }
 
 /// Default half-extents of a player's hitbox in atoms (`6x12` atom AABB).
-pub const PLAYER_HALF_SIZE: Vec2 = Vec2::new(4.0, 9.0);
+pub const PLAYER_HALF_SIZE: Vec2 = Vec2::new(4.4, 7.0);
 
 /// Downward gravity acceleration per tick in Bones world space (`+Y` up, `-Y` down).
 pub const PLAYER_GRAVITY_ACCEL: f32 = 0.36;
@@ -203,12 +207,15 @@ impl SessionPlugin for AstratomicPlayerPlugin {
             .add_system_to_stage(CoreStage::Startup, setup_player_system)
             .add_system_to_stage(CoreStage::PreUpdate, gather_local_player_input_system)
             .add_system_to_stage(CoreStage::PreUpdate, player_controller_system)
+            .add_system_to_stage(CoreStage::PreUpdate, step_rapier_physics_system)
             .add_system_to_stage(CoreStage::PreUpdate, kinematic_actor_movement_system)
             .add_system_to_stage(CoreStage::PreUpdate, sync_actor_particle_targets_system)
             .add_system_to_stage(CoreStage::PreUpdate, player_world_action_system)
             .add_system_to_stage(CoreStage::PreUpdate, player_throw_particles_system)
             .add_system_to_stage(CoreStage::PreUpdate, stamp_actor_objects_system)
+            .add_system_to_stage(CoreStage::PreUpdate, stamp_rigidbody_objects_system)
             .add_system_to_stage(CoreStage::Update, clear_actor_objects_system)
+            .add_system_to_stage(CoreStage::Update, clear_rigidbody_objects_system)
             .add_system_to_stage(CoreStage::PostUpdate, update_local_view_camera_system)
             .add_system_to_stage(CoreStage::PostUpdate, sync_pixel_rigidbodies_render_system)
             .add_system_to_stage(CoreStage::PostUpdate, sync_player_visuals_system);
@@ -562,16 +569,24 @@ pub fn sync_actor_particle_targets_system(
     for (player_id, ent) in ordered_players {
         if let Some(actor) = actors.get(ent) {
             // In ChunkWorld, +Y is downward, so actor.pos (Bones world +Y up) maps to [actor.pos.x, -actor.pos.y].
-            let mut center_pos = [actor.pos.x, -actor.pos.y];
-            if let Some(ref inputs) = match_inputs {
-                if let Some(input) = inputs.players.get(player_id as usize) {
-                    let aim = input.aim_vec2();
-                    if aim != Vec2::ZERO {
-                        let tool_slope = Vec2::new(aim.x, -aim.y).normalize();
-                        let tool_front = Vec2::new(actor.pos.x, -actor.pos.y) + tool_slope * 5.0;
-                        center_pos = [tool_front.x, tool_front.y];
-                    }
-                }
+            let aim = match_inputs
+                .as_ref()
+                .and_then(|inputs| inputs.players.get(player_id as usize))
+                .map(|i| i.aim_vec2())
+                .unwrap_or(Vec2::ZERO);
+
+            let facing_left = if aim.x.abs() > 0.05 {
+                aim.x < 0.0
+            } else {
+                actor.vel.x < -0.05
+            };
+            let tool_offset_x = if facing_left { -PLAYER_TOOL_OFFSET_X } else { PLAYER_TOOL_OFFSET_X };
+            let tool_origin = Vec2::new(actor.pos.x + tool_offset_x, -actor.pos.y);
+            let mut center_pos = [tool_origin.x, tool_origin.y];
+            if aim != Vec2::ZERO {
+                let tool_slope = Vec2::new(aim.x, -aim.y).normalize();
+                let tool_front = tool_origin + tool_slope * 5.0;
+                center_pos = [tool_front.x, tool_front.y];
             }
             actor_targets.set_target(player_actor_id(player_id), center_pos, 6.0);
         }
@@ -625,7 +640,8 @@ pub fn player_throw_particles_system(
 
         let tool_slope = Vec2::new(aim.x, -aim.y).normalize();
         let bound_slope = Vec2::new(-tool_slope.y, tool_slope.x);
-        let player_center = Vec2::new(actor.pos.x, -actor.pos.y);
+        let tool_offset_x = if aim.x < 0.0 { -PLAYER_TOOL_OFFSET_X } else { PLAYER_TOOL_OFFSET_X };
+        let player_center = Vec2::new(actor.pos.x + tool_offset_x, -actor.pos.y);
         let tool_front = player_center + tool_slope * 5.0;
         let new_tool_front = tool_front + tool_slope * 3.5;
 
@@ -728,7 +744,8 @@ pub fn player_world_action_system(
         // In ChunkWorld, +Y is downward, so Bones world (+Y up) maps to (aim.x, -aim.y).
         let tool_slope = Vec2::new(aim.x, -aim.y).normalize();
         let bound_slope = Vec2::new(-tool_slope.y, tool_slope.x);
-        let player_center = Vec2::new(actor.pos.x, -actor.pos.y);
+        let tool_offset_x = if aim.x < 0.0 { -PLAYER_TOOL_OFFSET_X } else { PLAYER_TOOL_OFFSET_X };
+        let player_center = Vec2::new(actor.pos.x + tool_offset_x, -actor.pos.y);
         let tool_front = player_center + tool_slope * 5.0;
 
         let center_bound = tool_front + tool_slope * TOOL_DISTANCE;
@@ -864,8 +881,12 @@ fn next_rigidbody_cid() -> Cid {
     Cid(bytes)
 }
 
-/// Interpolates and synchronizes `Transform` translation and rotation for all active
-/// [`PhysicsBodyHandle`] entities, and ensures dynamic rigidbodies have uploaded [`Sprite`] textures.
+thread_local! {
+    static RIGIDBODY_SCRATCH_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Interpolates, inverse-rasterizes, and synchronizes world-grid aligned textures and transforms
+/// for all active [`PhysicsBodyHandle`] entities with zero rotation holes and zero moiré gaps.
 pub fn sync_pixel_rigidbodies_render_system(
     local_view: Res<LocalView>,
     asset_server: Option<Res<AssetServer>>,
@@ -876,41 +897,77 @@ pub fn sync_pixel_rigidbodies_render_system(
     mut sprites: CompMut<Sprite>,
 ) {
     let alpha = local_view.render_alpha.clamp(0.0, 1.0);
-    for (ent, handle) in entities.iter_with(&handles) {
-        let interp_pos = handle.prev_pos.lerp(handle.pos, alpha);
-        let interp_angle = handle.prev_angle + (handle.angle - handle.prev_angle) * alpha;
-        if let Some(transform) = transforms.get_mut(ent) {
-            transform.translation.x = interp_pos.x;
-            transform.translation.y = interp_pos.y;
-            transform.translation.z = 1.0;
-            transform.rotation = Quat::from_rotation_z(interp_angle);
-        }
 
-        if let Some(ref server) = asset_server {
-            if let Some(pbody) = pixel_bodies.get_mut(ent) {
-                if pbody.image_handle.is_none() || !sprites.contains(ent) {
-                    let img = pbody.to_image();
+    RIGIDBODY_SCRATCH_BUFFER.with(|buf_cell| {
+        let mut scratch = buf_cell.borrow_mut();
+
+        for (ent, handle) in entities.iter_with(&handles) {
+            let Some(pbody) = pixel_bodies.get_mut(ent) else {
+                continue;
+            };
+
+            // Interpolated position and shortest-arc rotation angle
+            let render_pos = handle.prev_pos.lerp(handle.pos, alpha);
+            let diff = (handle.angle - handle.prev_angle + std::f32::consts::PI)
+                .rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            let render_angle = handle.prev_angle + diff * alpha;
+
+            let (sin_a, cos_a) = render_angle.sin_cos();
+            let half_w = pbody.width as f32 * 0.5;
+            let half_h = pbody.height as f32 * 0.5;
+            let x_extent = half_w * cos_a.abs() + half_h * sin_a.abs();
+            let y_extent = half_w * sin_a.abs() + half_h * cos_a.abs();
+
+            let min_wx = (render_pos.x - x_extent).floor() as i32;
+            let max_wx = (render_pos.x + x_extent - 1e-4).floor() as i32;
+            let min_wy = (render_pos.y - y_extent).floor() as i32;
+            let max_wy = (render_pos.y + y_extent - 1e-4).floor() as i32;
+
+            let bbox_w = (max_wx - min_wx + 1).max(1) as u32;
+            let bbox_h = (max_wy - min_wy + 1).max(1) as u32;
+            let needed_len = (bbox_w as usize) * (bbox_h as usize) * 4;
+
+            if scratch.len() < needed_len {
+                scratch.resize(needed_len, 0);
+            }
+            scratch[..needed_len].fill(0);
+
+            // Inverse rasterization: sample backward from each integer world cell into local grid
+            for wy in min_wy..=max_wy {
+                let img_y = (max_wy - wy) as usize;
+                for wx in min_wx..=max_wx {
+                    if let Some(atom) =
+                        pbody.sample_rigidbody_at_world_cell(wx, wy, render_pos, sin_a, cos_a)
+                    {
+                        if !atom.is_air() {
+                            let img_x = (wx - min_wx) as usize;
+                            let idx = (img_y * (bbox_w as usize) + img_x) * 4;
+                            scratch[idx..idx + 4].copy_from_slice(&atom.color);
+                        }
+                    }
+                }
+            }
+
+            // Transform center aligned exactly with the world-space bounding box
+            let center_x = min_wx as f32 + bbox_w as f32 * 0.5;
+            let center_y = min_wy as f32 + bbox_h as f32 * 0.5;
+
+            if let Some(transform) = transforms.get_mut(ent) {
+                transform.translation.x = center_x;
+                transform.translation.y = center_y;
+                transform.translation.z = 1.0;
+                transform.rotation = Quat::IDENTITY;
+            }
+
+            if let Some(ref server) = asset_server {
+                let new_cid = next_rigidbody_cid();
+                let untyped = if let Some(h) = pbody.image_handle {
+                    h.untyped()
+                } else {
                     let handle = UntypedHandle {
                         rid: Ulid::create(),
                     }
                     .typed::<Image>();
-                    let untyped = handle.untyped();
-                    let cid = next_rigidbody_cid();
-
-                    server.store.assets.insert(
-                        cid,
-                        LoadedAsset {
-                            cid,
-                            pack_spec: None,
-                            loc: AssetLoc {
-                                path: std::path::PathBuf::new(),
-                                pack: None,
-                            },
-                            dependencies: Vec::new(),
-                            data: SchemaBox::new(img),
-                        },
-                    );
-                    server.store.asset_ids.insert(untyped, cid);
                     pbody.image_handle = Some(handle);
                     sprites.insert(
                         ent,
@@ -921,10 +978,36 @@ pub fn sync_pixel_rigidbodies_render_system(
                             flip_y: false,
                         },
                     );
+                    handle.untyped()
+                };
+
+                if let Some(old_cid) = pbody.render_cid {
+                    server.store.assets.remove(&old_cid);
                 }
+                pbody.render_cid = Some(new_cid);
+
+                let img_data =
+                    image::RgbaImage::from_raw(bbox_w, bbox_h, scratch[..needed_len].to_vec())
+                        .unwrap();
+                let image = Image::Data(image::DynamicImage::ImageRgba8(img_data));
+
+                server.store.assets.insert(
+                    new_cid,
+                    LoadedAsset {
+                        cid: new_cid,
+                        pack_spec: None,
+                        loc: AssetLoc {
+                            path: std::path::PathBuf::new(),
+                            pack: None,
+                        },
+                        dependencies: Vec::new(),
+                        data: SchemaBox::new(image),
+                    },
+                );
+                server.store.asset_ids.insert(untyped, new_cid);
             }
         }
-    }
+    });
 }
 
 /// Synchronizes `AtlasSprite` animation frames and facing direction for all player entities,
@@ -1046,7 +1129,8 @@ pub fn sync_player_visuals_system(
             .get(ent)
             .map(|t| t.translation)
             .unwrap_or_else(|| actor.pos.extend(PLAYER_LAYER));
-        let offset_x = if flip_bool { 1.0 } else { -1.0 };
+        let tool_offset_x = if flip_bool { -PLAYER_TOOL_OFFSET_X } else { PLAYER_TOOL_OFFSET_X };
+        let offset_x = (if flip_bool { 1.0 } else { -1.0 }) + tool_offset_x;
         let offset_y = -3.5;
         let tool_pivot = Vec2::new(player_trans.x + offset_x, player_trans.y + offset_y);
         let tool_pos = tool_pivot + aim_norm * 3.0;
@@ -1416,8 +1500,8 @@ mod tests {
         {
             let transforms = session.world.component::<Transform>();
             let tool_trans = transforms.get(tool_ent).expect("tool must have Transform");
-            // facing right: offset_x = -1.0, aim_norm = (1.0, 0.0) -> pos.x = 10.0 - 1.0 + 3.0 = 12.0
-            assert!((tool_trans.translation.x - 12.0).abs() < 1e-4);
+            // facing right: offset_x = -1.0 + 5.0 = 4.0, aim_norm = (1.0, 0.0) -> pos.x = 10.0 + 4.0 + 3.0 = 17.0
+            assert_eq!(tool_trans.translation.x, 17.0);
             assert!((tool_trans.translation.y - (20.0 - 3.5)).abs() < 1e-4);
             assert_eq!(tool_trans.translation.z, PLAYER_LAYER + 0.1);
         }
@@ -1433,8 +1517,8 @@ mod tests {
         {
             let transforms = session.world.component::<Transform>();
             let tool_trans = transforms.get(tool_ent).unwrap();
-            // facing left: offset_x = 1.0, aim_norm = (-1.0, 0.0) -> pos.x = 10.0 + 1.0 - 3.0 = 8.0
-            assert!((tool_trans.translation.x - 8.0).abs() < 1e-4);
+            // facing left: offset_x = 1.0 - 5.0 = -4.0, aim_norm = (-1.0, 0.0) -> pos.x = 10.0 - 4.0 - 3.0 = 3.0
+            assert!((tool_trans.translation.x - 3.0).abs() < 1e-4);
         }
 
         // Destroy player -> orphaned tool must be cleaned up

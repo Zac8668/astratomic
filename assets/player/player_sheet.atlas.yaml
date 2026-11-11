@@ -1,4 +1,4 @@
-image: ./player_sheet.png
+image: ./player_sheet_robot.png
 tile_size: [24, 24]
 columns: 8
 rows: 5
