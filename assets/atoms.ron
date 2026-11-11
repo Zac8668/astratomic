@@ -18,7 +18,7 @@
     //8 Rock
     (default_state: Solid, weight: 2.5),
     //9 Acid
-    ( flow: 5, damage: 3.0, default_state: Liquid, weight: 0.1),
+    ( flow: 5, damage: 3.0, default_state: Liquid, weight: 1.1),
     //10 Compacted dirt
     (default_state: Solid, weight: 1.6),
     //11 Leaves

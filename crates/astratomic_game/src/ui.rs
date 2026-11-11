@@ -13,7 +13,7 @@ use astratomic_sim::{
     geom_tools::{Line, circle_points, square_points},
     particle::{MAX_PARTICLES, Particle, ParticlePool},
     world::{
-        ChunkGeneratorHook, ChunkWorld, DirtyRects, SimulationSettings, global_to_chunk,
+        ChunkGeneratorHook, ChunkWorld, DirtyRects, SimulationSettings, URect, global_to_chunk,
         world_to_global_atom,
     },
     world_store::WorldIoWorker,
@@ -21,6 +21,7 @@ use astratomic_sim::{
 use bones_framework::prelude::*;
 
 use crate::{
+    camera::{TrackingCamera, Zoom},
     player::{LocalInputState, LocalView, MatchInputs, PlayerControlled},
     prefabs::{
         PendingPrefabStamps, PrefabConfigs, PrefabPlaced, stamp_initial_window_prefabs,
@@ -34,11 +35,11 @@ use crate::{
 pub enum DebugTab {
     #[default]
     Tools = 0,
-    Particles = 1,
-    Simulation = 2,
+    Physics = 1,
+    Particles = 2,
     Player = 3,
     WorldGen = 4,
-    Physics = 5,
+    Simulation = 5,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, HasSchema)]
@@ -105,6 +106,30 @@ pub struct DebugToolState {
     pub sleep_all_bodies_requested: bool,
     pub rebuild_terrain_colliders_requested: bool,
     pub delete_body_requested: Option<u32>,
+    // --- Player Cheats & Positioning ---
+    pub teleport_player_pos: Option<Vec2>,
+    pub infinite_fuel: bool,
+    pub god_mode: bool,
+    pub stop_player_velocity_requested: bool,
+    // --- Rigidbodies & Spawners ---
+    pub spawn_at_cursor: bool,
+    pub spawn_preset_crate_big_requested: bool,
+    pub spawn_preset_boulder_heavy_requested: bool,
+    pub spawn_preset_plank_requested: bool,
+    pub spawn_preset_metal_beam_requested: bool,
+    pub spawn_preset_ice_requested: bool,
+    pub spawn_custom_box_requested: bool,
+    pub custom_rb_width: u32,
+    pub custom_rb_height: u32,
+    pub custom_rb_material_id: u8,
+    pub physics_gravity_y: f32,
+    pub focus_world_pos: Option<Vec2>,
+    // --- World Mass Tools ---
+    pub clear_window_requested: bool,
+    pub fill_window_water_requested: bool,
+    pub fill_window_sand_requested: bool,
+    // --- Simulation Stepping ---
+    pub step_ten_ticks_counter: u8,
     // --- Particle Testing Controls ---
     pub particle_spawn_type: ParticleSpawnType,
     pub particle_fx_color: [u8; 4],
@@ -171,6 +196,26 @@ impl Default for DebugToolState {
             sleep_all_bodies_requested: false,
             rebuild_terrain_colliders_requested: false,
             delete_body_requested: None,
+            teleport_player_pos: None,
+            infinite_fuel: false,
+            god_mode: false,
+            stop_player_velocity_requested: false,
+            spawn_at_cursor: true,
+            spawn_preset_crate_big_requested: false,
+            spawn_preset_boulder_heavy_requested: false,
+            spawn_preset_plank_requested: false,
+            spawn_preset_metal_beam_requested: false,
+            spawn_preset_ice_requested: false,
+            spawn_custom_box_requested: false,
+            custom_rb_width: 16,
+            custom_rb_height: 16,
+            custom_rb_material_id: 12, // Wood
+            physics_gravity_y: -980.0,
+            focus_world_pos: None,
+            clear_window_requested: false,
+            fill_window_water_requested: false,
+            fill_window_sand_requested: false,
+            step_ten_ticks_counter: 0,
             particle_spawn_type: ParticleSpawnType::Fx,
             particle_fx_color: [255, 180, 40, 255], // spark orange
             particle_fx_lifetime: 20,
@@ -298,6 +343,8 @@ pub fn camera_control_system(
     mut local_input: Option<ResMut<LocalInputState>>,
     mut cameras: CompMut<Camera>,
     mut transforms: CompMut<Transform>,
+    mut tracking_camera: Option<ResMut<TrackingCamera>>,
+    mut zoom: Option<ResMut<Zoom>>,
     mut sim_settings: ResMut<SimulationSettings>,
     mut state: ResMut<DebugToolState>,
 ) {
@@ -322,6 +369,11 @@ pub fn camera_control_system(
         if state.just_pressed_keys.contains(&KeyCode::B) {
             state.spawn_boulder_requested = true;
         }
+        if state.just_pressed_keys.contains(&KeyCode::T) {
+            if let Some(cur) = mouse_world.as_ref().and_then(|mw| mw.0) {
+                state.teleport_player_pos = Some(cur);
+            }
+        }
         let hotkey_materials = [
             (KeyCode::Key0, 0_u8),
             (KeyCode::Key1, 2_u8),
@@ -337,6 +389,55 @@ pub fn camera_control_system(
         for (key, mat_id) in hotkey_materials {
             if state.just_pressed_keys.contains(&key) {
                 state.selected_material_id = mat_id;
+            }
+        }
+    }
+
+    // Step 10 ticks counter
+    if state.step_ten_ticks_counter > 0 {
+        sim_settings.step_once = true;
+        state.step_ten_ticks_counter = state.step_ten_ticks_counter.saturating_sub(1);
+    }
+
+    // Handle teleport player request
+    if let Some(target) = state.teleport_player_pos.take() {
+        for (ent, ctrl) in entities.iter_with(&player_controlled) {
+            if ctrl.player_id == local_view.local_player_id
+                && let Some(actor) = actors.get_mut(ent)
+            {
+                actor.pos = target;
+                actor.prev_pos = target;
+                actor.vel = Vec2::ZERO;
+                local_view.camera_pos = target;
+                if let Some(ref mut tracking) = tracking_camera {
+                    tracking.snap_to(target);
+                }
+            }
+        }
+    }
+
+    // Handle stop player velocity request
+    if state.stop_player_velocity_requested {
+        state.stop_player_velocity_requested = false;
+        for (ent, ctrl) in entities.iter_with(&player_controlled) {
+            if ctrl.player_id == local_view.local_player_id
+                && let Some(actor) = actors.get_mut(ent)
+            {
+                actor.vel = Vec2::ZERO;
+            }
+        }
+    }
+
+    // Handle infinite fuel and god mode
+    if state.infinite_fuel || state.god_mode {
+        for (ent, ctrl) in entities.iter_with(&player_controlled) {
+            if ctrl.player_id == local_view.local_player_id
+                && let Some(st) = actor_states.get_mut(ent)
+            {
+                st.jetpack_fuel = st.max_jetpack_fuel;
+                if state.god_mode {
+                    st.buried_ticks = 0;
+                }
             }
         }
     }
@@ -357,7 +458,25 @@ pub fn camera_control_system(
                     *st = ActorState::default();
                 }
                 local_view.camera_pos = spawn_pos;
+                if let Some(ref mut tracking) = tracking_camera {
+                    tracking.snap_to(spawn_pos);
+                }
             }
+        }
+    }
+
+    // Handle focus world pos request
+    if let Some(target) = state.focus_world_pos.take() {
+        local_view.camera_pos = target;
+        if let Some(ref mut tracking) = tracking_camera {
+            tracking.snap_to(target);
+        }
+        for (_ent, (_camera, transform)) in entities.iter_with((&mut cameras, &mut transforms)) {
+            transform.translation.x = target.x;
+            transform.translation.y = target.y;
+        }
+        if let Some(ref mut li) = local_input {
+            li.camera_follow_player = false;
         }
     }
 
@@ -407,12 +526,18 @@ pub fn camera_control_system(
         if state.reset_camera_requested {
             transform.translation.x = local_view.camera_pos.x;
             transform.translation.y = local_view.camera_pos.y;
+            if let Some(ref mut tracking) = tracking_camera {
+                tracking.snap_to(local_view.camera_pos);
+            }
             if let Some(ref mut li) = local_input {
                 li.camera_follow_player = true;
             }
             state.reset_camera_requested = false;
         }
         camera.size = CameraSize::FixedHeight(state.camera_height);
+        if let Some(ref mut z) = zoom {
+            z.0 = state.camera_height / 1080.0;
+        }
 
         if !follow_player {
             transform.translation.x += velocity.x * dt;
@@ -459,6 +584,11 @@ pub fn debug_spawn_rigidbody_system(
     mut transforms: CompMut<Transform>,
     mut state: ResMut<DebugToolState>,
 ) {
+    // 0. Update Rapier gravity
+    if let Some(ref mut physics) = rapier_physics {
+        physics.gravity.y = state.physics_gravity_y;
+    }
+
     // 1. Process physics lifecycle and maintenance requests
     if state.wake_all_bodies_requested {
         state.wake_all_bodies_requested = false;
@@ -520,18 +650,38 @@ pub fn debug_spawn_rigidbody_system(
         }
     }
 
-    // 2. Process crate / boulder / prefab spawn requests
-    if !state.spawn_crate_requested
-        && !state.spawn_boulder_requested
-        && !state.spawn_prefab_rigidbody_requested
+    // 2. Process crate / boulder / prefab / custom spawn requests
+    let is_prefab = state.spawn_prefab_rigidbody_requested;
+    let is_crate = state.spawn_crate_requested;
+    let is_boulder = state.spawn_boulder_requested;
+    let is_big_crate = state.spawn_preset_crate_big_requested;
+    let is_heavy_boulder = state.spawn_preset_boulder_heavy_requested;
+    let is_plank = state.spawn_preset_plank_requested;
+    let is_metal_beam = state.spawn_preset_metal_beam_requested;
+    let is_ice = state.spawn_preset_ice_requested;
+    let is_custom = state.spawn_custom_box_requested;
+
+    if !is_prefab
+        && !is_crate
+        && !is_boulder
+        && !is_big_crate
+        && !is_heavy_boulder
+        && !is_plank
+        && !is_metal_beam
+        && !is_ice
+        && !is_custom
     {
         return;
     }
-    let is_prefab = state.spawn_prefab_rigidbody_requested;
-    let is_crate = state.spawn_crate_requested;
     state.spawn_crate_requested = false;
     state.spawn_boulder_requested = false;
     state.spawn_prefab_rigidbody_requested = false;
+    state.spawn_preset_crate_big_requested = false;
+    state.spawn_preset_boulder_heavy_requested = false;
+    state.spawn_preset_plank_requested = false;
+    state.spawn_preset_metal_beam_requested = false;
+    state.spawn_preset_ice_requested = false;
+    state.spawn_custom_box_requested = false;
 
     let Some(ref mut physics) = rapier_physics else {
         eprintln!("Cannot spawn dynamic rigidbody: RapierPhysics resource is missing!");
@@ -542,15 +692,13 @@ pub fn debug_spawn_rigidbody_system(
         .as_ref()
         .is_some_and(|ctx| ctx.wants_pointer_input() || ctx.is_pointer_over_area());
 
-    // If spawned from egui button click, spawn slightly above camera center so the user sees it immediately.
-    // If spawned via hotkeys ('C' / 'B'), spawn directly at cursor world position.
-    let spawn_pos = if egui_wants_pointer {
-        local_view.camera_pos + Vec2::new(0.0, 30.0)
-    } else {
+    let spawn_pos = if state.spawn_at_cursor && !egui_wants_pointer {
         mouse_world
             .as_ref()
             .and_then(|m| m.0)
             .unwrap_or(local_view.camera_pos + Vec2::new(0.0, 30.0))
+    } else {
+        local_view.camera_pos + Vec2::new(0.0, 30.0)
     };
 
     if is_prefab {
@@ -573,11 +721,53 @@ pub fn debug_spawn_rigidbody_system(
 
     let body = if is_crate {
         astratomic_physics::rigidbody::PixelRigidBody::new_crate(16, 16, spawn_pos)
-    } else {
+    } else if is_big_crate {
+        astratomic_physics::rigidbody::PixelRigidBody::new_crate(24, 24, spawn_pos)
+    } else if is_boulder {
         astratomic_physics::rigidbody::PixelRigidBody::new_box(
             16,
             16,
-            Atom::with_state(1, AtomState::Solid, [128, 128, 128, 255]),
+            Atom::with_state(8, AtomState::Solid, [80, 80, 80, 255]),
+            spawn_pos,
+        )
+    } else if is_heavy_boulder {
+        astratomic_physics::rigidbody::PixelRigidBody::new_box(
+            32,
+            32,
+            Atom::with_state(8, AtomState::Solid, [80, 80, 80, 255]),
+            spawn_pos,
+        )
+    } else if is_plank {
+        astratomic_physics::rigidbody::PixelRigidBody::new_box(
+            32,
+            8,
+            Atom::with_state(12, AtomState::Solid, [120, 80, 40, 255]),
+            spawn_pos,
+        )
+    } else if is_metal_beam {
+        astratomic_physics::rigidbody::PixelRigidBody::new_box(
+            32,
+            8,
+            Atom::with_state(14, AtomState::Solid, [168, 104, 78, 255]),
+            spawn_pos,
+        )
+    } else if is_ice {
+        astratomic_physics::rigidbody::PixelRigidBody::new_box(
+            16,
+            16,
+            Atom::with_state(3, AtomState::Solid, [180, 220, 255, 255]),
+            spawn_pos,
+        )
+    } else {
+        // Custom Box
+        let w = state.custom_rb_width.clamp(4, 64);
+        let h = state.custom_rb_height.clamp(4, 64);
+        let mat_id = state.custom_rb_material_id;
+        let color = Atom::material_preview_color(mat_id);
+        astratomic_physics::rigidbody::PixelRigidBody::new_box(
+            w as u16,
+            h as u16,
+            Atom::with_state(mat_id, AtomState::Solid, color),
             spawn_pos,
         )
     };
@@ -703,6 +893,37 @@ pub fn world_debug_tool_system(
     mut particle_pool: Option<ResMut<ParticlePool>>,
     mut state: ResMut<DebugToolState>,
 ) {
+    // Process mass window editing requests from debug UI buttons
+    if state.clear_window_requested
+        || state.fill_window_water_requested
+        || state.fill_window_sand_requested
+    {
+        let fill_mat_id = if state.clear_window_requested {
+            0_u8
+        } else if state.fill_window_water_requested {
+            3_u8
+        } else {
+            2_u8
+        };
+        state.clear_window_requested = false;
+        state.fill_window_water_requested = false;
+        state.fill_window_sand_requested = false;
+
+        let full_rect = URect::full_chunk();
+        for (&pos, chunk) in chunk_world.chunks.iter_mut() {
+            let grid = chunk.grid_mut();
+            if fill_mat_id == 0 {
+                grid.atoms.fill(Atom::VOID);
+            } else {
+                let atom = Atom::new_with_rng(fill_mat_id, &materials, &mut fastrand::Rng::new());
+                grid.atoms.fill(atom);
+            }
+            chunk.collider_dirty = true;
+            dirty_rects.current.insert(pos, full_rect);
+            dirty_rects.render.insert(pos, full_rect);
+        }
+    }
+
     let egui_wants_pointer = egui_ctx
         .as_ref()
         .is_some_and(|ctx| ctx.wants_pointer_input() || ctx.is_pointer_over_area());
@@ -1459,6 +1680,7 @@ pub fn debug_ui_system(
     mut pending_stamps: ResMut<PendingPrefabStamps>,
     io_worker: Res<WorldIoWorker>,
     rapier_physics: Option<Res<astratomic_physics::rigidbody::RapierPhysics>>,
+    mut tracking_camera: Option<ResMut<TrackingCamera>>,
     mut state: ResMut<DebugToolState>,
 ) {
     let Some(ctx) = egui_ctx else {
@@ -1484,7 +1706,8 @@ pub fn debug_ui_system(
 
     egui::Window::new("Astratomic World Debug")
         .default_pos(egui::pos2(12.0, 12.0))
-        .default_width(340.0)
+        .default_width(380.0)
+        .min_width(340.0)
         .resizable(true)
         .show(&ctx, |ui| {
             // --- Persistent Telemetry Header Banner ---
@@ -1502,6 +1725,15 @@ pub fn debug_ui_system(
                 if let Some(ref pool) = particle_pool {
                     ui.separator();
                     ui.label(format!("Parts: {}", pool.len()));
+                }
+                if let Some(ref phys) = rapier_physics {
+                    let awake = phys
+                        .bodies
+                        .iter()
+                        .filter(|(_, b)| b.is_dynamic() && !b.is_sleeping())
+                        .count();
+                    ui.separator();
+                    ui.label(format!("Bodies: {} ({})", phys.bodies.len(), awake));
                 }
                 ui.separator();
                 let pause_label = if sim_settings.paused {
@@ -1522,361 +1754,67 @@ pub fn debug_ui_system(
             // --- Tab Selection Bar ---
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut state.selected_tab, DebugTab::Tools, "🛠 Tools");
+                ui.selectable_value(&mut state.selected_tab, DebugTab::Physics, "🪐 Physics");
                 ui.selectable_value(&mut state.selected_tab, DebugTab::Particles, "✨ Particles");
-                ui.selectable_value(&mut state.selected_tab, DebugTab::Simulation, "⏱ Sim & Cam");
                 ui.selectable_value(&mut state.selected_tab, DebugTab::Player, "🏃 Player");
-                ui.selectable_value(&mut state.selected_tab, DebugTab::WorldGen, "🌍 World Gen");
-                ui.selectable_value(&mut state.selected_tab, DebugTab::Physics, "🪐 Rapier Physics");
+                ui.selectable_value(&mut state.selected_tab, DebugTab::WorldGen, "🌍 World");
+                ui.selectable_value(
+                    &mut state.selected_tab,
+                    DebugTab::Simulation,
+                    "👁 Overlays & Sim",
+                );
             });
 
             ui.separator();
 
-            // --- Tab Body ---
-            match state.selected_tab {
-                DebugTab::Tools => {
-                    ui.heading("World Tool");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(
-                            &mut state.tool_mode,
-                            DebugToolMode::PlayerTool,
-                            "⛏ Player Tool",
-                        );
-                        ui.selectable_value(
-                            &mut state.tool_mode,
-                            DebugToolMode::Brush,
-                            "🖌 Material Brush",
-                        );
-                        ui.selectable_value(
-                            &mut state.tool_mode,
-                            DebugToolMode::PrefabStamp,
-                            "🌲 Stamp Prefab",
-                        );
-                        ui.selectable_value(
-                            &mut state.tool_mode,
-                            DebugToolMode::ParticleEmitter,
-                            "✨ Particle Tool",
-                        );
-                        ui.selectable_value(
-                            &mut state.tool_mode,
-                            DebugToolMode::PhysicsGrab,
-                            "🧲 Physics Grab",
-                        );
-                    });
-
-                    match state.tool_mode {
-                        DebugToolMode::PlayerTool => {
-                            ui.small("Left-Click: Excavate along Aim | Right-Click: Emit Material (Keys 0-9)");
-                        }
-                        DebugToolMode::Brush => {
-                            ui.small("Left-Click: Paint Material | Right-Click: Erase (Void) | Keys 0-9");
-                            ui.horizontal(|ui| {
-                                ui.label("Radius:");
-                                ui.add(egui::Slider::new(&mut state.brush_radius, 0..=32).suffix(" px"));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Shape:");
-                                ui.selectable_value(&mut state.brush_shape, BrushShape::Circle, "Circle");
-                                ui.selectable_value(&mut state.brush_shape, BrushShape::Square, "Square");
-                                ui.checkbox(&mut state.only_air, "Only Fill Air");
-                            });
-
-                            ui.label("Materials:");
-                            egui::Grid::new("material_palette_grid")
-                                .num_columns(3)
-                                .spacing([6.0, 4.0])
-                                .show(ui, |ui| {
-                                    for (idx, &mat_id) in Atom::PAINTABLE_MATERIAL_IDS.iter().enumerate() {
-                                        let [r, g, b, _] = Atom::material_preview_color(mat_id);
-                                        let selected = state.selected_material_id == mat_id;
-                                        let label = Atom::material_name(mat_id);
-
-                                        ui.horizontal(|ui| {
-                                            let (swatch_rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(12.0, 12.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(
-                                                swatch_rect,
-                                                2.0,
-                                                egui::Color32::from_rgb(r, g, b),
-                                            );
-                                            if ui.selectable_label(selected, label).clicked() {
-                                                state.selected_material_id = mat_id;
-                                            }
-                                        });
-
-                                        if (idx + 1) % 3 == 0 {
-                                            ui.end_row();
-                                        }
-                                    }
-                                });
-                        }
-                        DebugToolMode::PrefabStamp => {
-                            ui.small("Left-Click: Stamp Selected Prefab | Right-Click: Erase");
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut state.snap_prefab_to_surface, "Snap to Surface");
-                                ui.checkbox(&mut state.overwrite_prefab_terrain, "Overwrite Terrain");
-                                if ui.button("🏗 Spawn as Rigidbody").clicked() {
-                                    state.spawn_prefab_rigidbody_requested = true;
-                                }
-                            });
-
-                            if prefab_configs.0.is_empty() {
-                                ui.label("No prefabs found in assets/prefabs/");
-                            } else {
-                                ui.horizontal_wrapped(|ui| {
-                                    for (idx, config) in prefab_configs.0.iter().enumerate() {
-                                        let label = format!(
-                                            "{} ({}x{})",
-                                            config.display_name,
-                                            config.image.width(),
-                                            config.image.height()
-                                        );
-                                        if ui
-                                            .selectable_label(state.selected_prefab_idx == idx, label)
-                                            .clicked()
-                                        {
-                                            state.selected_prefab_idx = idx;
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        DebugToolMode::ParticleEmitter => {
-                            ui.small("Left-Click: Emit Particles | Right-Click: Explosion Burst");
-                            ui.horizontal(|ui| {
-                                if ui.button("Open Full Particle Settings ➡").clicked() {
-                                    state.selected_tab = DebugTab::Particles;
-                                }
-                            });
-                        }
-                        DebugToolMode::PhysicsGrab => {
-                            ui.small("Left-Click & Drag: Grab and throw dynamic rigidbodies | Release to toss");
-                            if let Some(ref phys) = rapier_physics {
-                                let dynamic_count = phys.bodies.iter().filter(|(_, b)| b.is_dynamic()).count();
-                                ui.label(format!("Dynamic bodies in world: {}", dynamic_count));
-                                if let Some([idx, _]) = state.grabbed_body {
-                                    ui.strong(format!("Currently holding body #{}", idx));
-                                } else {
-                                    ui.small("Click on any dynamic body in the world to pick it up.");
-                                }
-                            }
-                        }
-                    }
-
-                    ui.separator();
-                    ui.heading("Cursor Inspector");
-                    if let (Some(global), Some(cp)) = (cursor_global, cursor_chunk_pos) {
-                        ui.label(format!(
-                            "Atom: ({}, {}) | Chunk: ({}, {}) [{}x{}]",
-                            global.x, global.y, cp.chunk.x, cp.chunk.y, cp.atom.x, cp.atom.y
-                        ));
-                        if let Some(atom) = hovered_atom {
-                            ui.horizontal(|ui| {
-                                let [r, g, b, a] = if atom.is_void() {
-                                    [30, 32, 42, 255]
-                                } else {
-                                    atom.color
-                                };
-                                let (rect, _) =
-                                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                                ui.painter().rect_filled(
-                                    rect,
-                                    2.0,
-                                    egui::Color32::from_rgba_unmultiplied(r, g, b, a),
-                                );
-                                ui.label(format!(
-                                    "#{} {} ({:?}) vel=({},{}) moving={}",
-                                    atom.material_id,
-                                    Atom::material_name(atom.material_id),
-                                    atom.state(),
-                                    atom.vx,
-                                    atom.vy,
-                                    atom.moving()
-                                ));
-                            });
-                        } else {
-                            ui.label("Atom: <unloaded chunk>");
-                        }
-                    } else {
-                        ui.label("Cursor: <outside window>");
-                    }
-                }
-
-                DebugTab::Particles => {
-                    ui.heading("Particle Pool Status");
-                    let active_count = particle_pool.as_ref().map(|p| p.len()).unwrap_or(0);
-                    let matter_count = particle_pool
-                        .as_ref()
-                        .map(|p| p.particles().iter().filter(|pt| pt.atom.life_5bit() == 0).count())
-                        .unwrap_or(0);
-                    let fx_count = active_count.saturating_sub(matter_count);
-
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Active: {} / {}",
-                                active_count, MAX_PARTICLES
-                            ))
-                            .strong(),
-                        );
-                        ui.separator();
-                        ui.label(format!("Matter: {}", matter_count));
-                        ui.separator();
-                        ui.label(format!("FX: {}", fx_count));
-                    });
-
-                    let fill_ratio = active_count as f32 / MAX_PARTICLES as f32;
-                    ui.add(
-                        egui::ProgressBar::new(fill_ratio)
-                            .text(format!("{:.1}% Capacity", fill_ratio * 100.0)),
-                    );
-
-                    ui.horizontal(|ui| {
-                        if ui.button("🧹 Clear All Particles").clicked() {
-                            if let Some(ref mut pool) = particle_pool {
-                                pool.clear();
-                            }
-                        }
-                        ui.checkbox(&mut state.show_particles_overlay, "Show Particles Overlay");
-                    });
-
-                    ui.separator();
-                    ui.heading("Particle Emitter Tool");
-                    ui.horizontal(|ui| {
-                        let is_active = matches!(state.tool_mode, DebugToolMode::ParticleEmitter);
-                        let label = if is_active {
-                            "✅ Emitter Active (Click World)"
-                        } else {
-                            "🎯 Activate World Click Emitter"
-                        };
-                        if ui.selectable_label(is_active, label).clicked() {
-                            state.tool_mode = if is_active {
-                                DebugToolMode::PlayerTool
-                            } else {
-                                DebugToolMode::ParticleEmitter
-                            };
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Mode:");
-                        ui.selectable_value(&mut state.particle_spawn_type, ParticleSpawnType::Fx, "✨ Ephemeral FX");
-                        ui.selectable_value(&mut state.particle_spawn_type, ParticleSpawnType::Matter, "⛏ Real Matter");
-                        ui.selectable_value(&mut state.particle_spawn_type, ParticleSpawnType::Explosion, "💣 Explosion");
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Speed:");
-                        ui.add(egui::Slider::new(&mut state.particle_speed, 0.5..=24.0).suffix(" px/t"));
-                        ui.label("Spread:");
-                        ui.add(egui::Slider::new(&mut state.particle_spread_deg, 0.0..=90.0).suffix("°"));
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Angle:");
-                        ui.add(egui::Slider::new(&mut state.particle_angle_deg, -180.0..=180.0).suffix("°"));
-                    });
-
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Quick Aim:");
-                        if ui.small_button("⬆ Up").clicked() { state.particle_angle_deg = -90.0; }
-                        if ui.small_button("↗ Up-Right").clicked() { state.particle_angle_deg = -45.0; }
-                        if ui.small_button("➡ Right").clicked() { state.particle_angle_deg = 0.0; }
-                        if ui.small_button("↘ Down-Right").clicked() { state.particle_angle_deg = 45.0; }
-                        if ui.small_button("⬇ Down").clicked() { state.particle_angle_deg = 90.0; }
-                        if ui.small_button("⬅ Left").clicked() { state.particle_angle_deg = 180.0; }
-                    });
-
-                    ui.checkbox(
-                        &mut state.particle_continuous_fountain,
-                        "⛲ Continuous stream while holding Left-Click",
-                    );
-
-                    match state.particle_spawn_type {
-                        ParticleSpawnType::Fx => {
-                            ui.separator();
-                            ui.label("Ephemeral FX Settings:");
-                            ui.horizontal(|ui| {
-                                ui.label("Lifetime:");
-                                ui.add(egui::Slider::new(&mut state.particle_fx_lifetime, 1..=31).suffix(" ticks"));
-                                ui.checkbox(&mut state.particle_fx_bounces, "Bouncing (FLAG_PARTICLE_BOUNCE)");
-                            });
-
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Presets:");
-                                if ui.small_button("🔥 Spark").clicked() {
-                                    state.particle_fx_color = [255, 180, 40, 255];
-                                    state.particle_fx_bounces = true;
-                                }
-                                if ui.small_button("💧 Foam").clicked() {
-                                    state.particle_fx_color = [80, 200, 255, 230];
-                                    state.particle_fx_bounces = false;
-                                }
-                                if ui.small_button("💨 Smoke").clicked() {
-                                    state.particle_fx_color = [180, 180, 190, 200];
-                                    state.particle_fx_bounces = false;
-                                }
-                                if ui.small_button("🟢 Acid").clicked() {
-                                    state.particle_fx_color = [50, 240, 60, 220];
-                                    state.particle_fx_bounces = true;
-                                }
-                                if ui.small_button("🟣 Plasma").clicked() {
-                                    state.particle_fx_color = [220, 80, 255, 255];
-                                    state.particle_fx_bounces = true;
-                                }
-                            });
-
-                            let mut c = egui::Color32::from_rgba_unmultiplied(
-                                state.particle_fx_color[0],
-                                state.particle_fx_color[1],
-                                state.particle_fx_color[2],
-                                state.particle_fx_color[3],
+            // --- Scrollable Tab Body ---
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(640.0)
+                .show(ui, |ui| match state.selected_tab {
+                    DebugTab::Tools => {
+                        ui.heading("🛠 World Interaction & Tools");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(
+                                &mut state.tool_mode,
+                                DebugToolMode::PlayerTool,
+                                "⛏ Player Tool",
                             );
-                            ui.horizontal(|ui| {
-                                ui.label("FX Color:");
-                                let (swatch_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(14.0, 14.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(swatch_rect, 2.0, c);
-                                if egui::color_picker::color_edit_button_srgba(
-                                    ui,
-                                    &mut c,
-                                    egui::color_picker::Alpha::Opaque,
-                                )
-                                .changed()
-                                {
-                                    state.particle_fx_color = [c.r(), c.g(), c.b(), c.a()];
-                                }
-                            });
-                        }
-                        ParticleSpawnType::Matter => {
-                            ui.separator();
-                            ui.small("Click on solid/powder/liquid cells in the world to eject them, or click air to emit the selected material below:");
-                            ui.horizontal(|ui| {
-                                ui.label("Material in Air:");
-                                let [mr, mg, mb, _] =
-                                    Atom::material_preview_color(state.selected_material_id);
-                                let (swatch_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(14.0, 14.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    swatch_rect,
-                                    2.0,
-                                    egui::Color32::from_rgb(mr, mg, mb),
-                                );
-                                let curr_name = Atom::material_name(state.selected_material_id);
-                                egui::ComboBox::from_id_salt("particle_matter_select")
-                                    .selected_text(curr_name)
-                                    .show_ui(ui, |ui| {
-                                        for &id in &Atom::PAINTABLE_MATERIAL_IDS {
-                                            if id != 0 {
-                                                let [r, g, b, _] = Atom::material_preview_color(id);
+                            ui.selectable_value(
+                                &mut state.tool_mode,
+                                DebugToolMode::Brush,
+                                "🖌 Material Brush",
+                            );
+                            ui.selectable_value(
+                                &mut state.tool_mode,
+                                DebugToolMode::PrefabStamp,
+                                "🌲 Stamp Prefab",
+                            );
+                            ui.selectable_value(
+                                &mut state.tool_mode,
+                                DebugToolMode::PhysicsGrab,
+                                "🧲 Physics Grab",
+                            );
+                        });
+
+                        ui.add_space(4.0);
+
+                        match state.tool_mode {
+                            DebugToolMode::PlayerTool => {
+                                ui.group(|ui| {
+                                    ui.strong("⛏ Player Tool & Excavator");
+                                    ui.small("Left-Click: Excavate terrain along aim | Right-Click: Emit material (Keys 0-9)");
+                                    ui.add_space(2.0);
+                                    ui.label("Selected Material Hotbar Slot:");
+                                    if let Some(ref mut li) = local_input {
+                                        ui.horizontal_wrapped(|ui| {
+                                            let hotbar_mats = [0_u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+                                            for (slot_idx, &mat_id) in hotbar_mats.iter().enumerate() {
+                                                let is_sel = li.selected_slot as usize == slot_idx;
+                                                let [r, g, b, _] = Atom::material_preview_color(mat_id);
                                                 ui.horizontal(|ui| {
                                                     let (rect, _) = ui.allocate_exact_size(
-                                                        egui::vec2(10.0, 10.0),
+                                                        egui::vec2(12.0, 12.0),
                                                         egui::Sense::hover(),
                                                     );
                                                     ui.painter().rect_filled(
@@ -1884,529 +1822,1144 @@ pub fn debug_ui_system(
                                                         2.0,
                                                         egui::Color32::from_rgb(r, g, b),
                                                     );
-                                                    ui.selectable_value(
-                                                        &mut state.selected_material_id,
-                                                        id,
-                                                        Atom::material_name(id),
-                                                    );
+                                                    let label = format!("{}: {}", slot_idx, Atom::material_name(mat_id));
+                                                    if ui.selectable_label(is_sel, label).clicked() {
+                                                        li.selected_slot = slot_idx as u8;
+                                                        state.selected_material_id = mat_id;
+                                                    }
                                                 });
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            DebugToolMode::Brush => {
+                                ui.group(|ui| {
+                                    ui.strong("🖌 Material Brush Settings");
+                                    ui.small("Left-Click: Paint Material | Right-Click: Erase (Void) | Keys 0-9");
+                                    ui.horizontal(|ui| {
+                                        ui.label("Radius:");
+                                        ui.add(egui::Slider::new(&mut state.brush_radius, 0..=32).suffix(" px"));
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Quick Sizes:");
+                                        for r in [1, 2, 4, 8, 16, 24, 32] {
+                                            if ui.small_button(format!("{}px", r)).clicked() {
+                                                state.brush_radius = r;
                                             }
                                         }
                                     });
-                            });
-                        }
-                        ParticleSpawnType::Explosion => {
-                            ui.separator();
-                            ui.label("Explosion Settings:");
-                            ui.horizontal(|ui| {
-                                ui.label("Blast Radius:");
-                                ui.add(egui::Slider::new(&mut state.particle_burst_radius, 1..=16).suffix(" px"));
-                            });
-                            ui.small("Clicking the world detonate-ejects all terrain atoms within radius radially outwards!");
-                        }
-                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label("Shape:");
+                                        ui.selectable_value(&mut state.brush_shape, BrushShape::Circle, "Circle");
+                                        ui.selectable_value(&mut state.brush_shape, BrushShape::Square, "Square");
+                                        ui.checkbox(&mut state.only_air, "Only Fill Air");
+                                    });
 
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if let Some(cursor) = cursor_global {
-                            if ui.button("💥 Trigger at Cursor").clicked() {
-                                if let Some(ref mut pool) = particle_pool {
-                                    let rad = state.particle_angle_deg.to_radians();
-                                    let vel = [rad.cos() * state.particle_speed, rad.sin() * state.particle_speed];
-                                    let spawn_pos = [cursor.x as f32 + 0.5, cursor.y as f32 + 0.5];
-                                    match state.particle_spawn_type {
-                                        ParticleSpawnType::Fx => {
-                                            pool.spawn_fx(
-                                                spawn_pos,
-                                                vel,
-                                                state.particle_fx_color,
-                                                state.particle_fx_lifetime,
-                                                state.particle_fx_bounces,
+                                    ui.add_space(4.0);
+                                    ui.strong("Material Palette:");
+
+                                    let categories: [(&str, &[u8]); 4] = [
+                                        ("Powders", &[2, 4, 7, 10, 13]),
+                                        ("Liquids", &[3, 5, 9]),
+                                        ("Solids", &[8, 12, 6, 11, 14, 15]),
+                                        ("Special", &[0]),
+                                    ];
+
+                                    for (cat_name, mat_ids) in categories {
+                                        ui.label(format!("{}:", cat_name));
+                                        ui.horizontal_wrapped(|ui| {
+                                            for &mat_id in mat_ids {
+                                                let [r, g, b, _] = Atom::material_preview_color(mat_id);
+                                                let selected = state.selected_material_id == mat_id;
+                                                let label = Atom::material_name(mat_id);
+
+                                                ui.horizontal(|ui| {
+                                                    let (swatch_rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(12.0, 12.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(
+                                                        swatch_rect,
+                                                        2.0,
+                                                        egui::Color32::from_rgb(r, g, b),
+                                                    );
+                                                    if ui.selectable_label(selected, label).clicked() {
+                                                        state.selected_material_id = mat_id;
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            DebugToolMode::PrefabStamp => {
+                                ui.group(|ui| {
+                                    ui.strong("🌲 Prefab Stamp Tool");
+                                    ui.small("Left-Click: Stamp Selected Prefab | Right-Click: Erase");
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(&mut state.snap_prefab_to_surface, "Snap to Surface");
+                                        ui.checkbox(&mut state.overwrite_prefab_terrain, "Overwrite Terrain");
+                                        if ui.button("🏗 Spawn as Rigidbody").clicked() {
+                                            state.spawn_prefab_rigidbody_requested = true;
+                                        }
+                                    });
+
+                                    if prefab_configs.0.is_empty() {
+                                        ui.label("No prefabs found in assets/prefabs/");
+                                    } else {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (idx, config) in prefab_configs.0.iter().enumerate() {
+                                                let label = format!(
+                                                    "{} ({}x{})",
+                                                    config.display_name,
+                                                    config.image.width(),
+                                                    config.image.height()
+                                                );
+                                                if ui
+                                                    .selectable_label(state.selected_prefab_idx == idx, label)
+                                                    .clicked()
+                                                {
+                                                    state.selected_prefab_idx = idx;
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            DebugToolMode::PhysicsGrab => {
+                                ui.group(|ui| {
+                                    ui.strong("🧲 Physics Grab Tool");
+                                    ui.small("Left-Click & Drag: Grab and throw dynamic rigidbodies | Release to toss");
+                                    if let Some(ref phys) = rapier_physics {
+                                        let dynamic_count = phys.bodies.iter().filter(|(_, b)| b.is_dynamic()).count();
+                                        ui.label(format!("Dynamic bodies in world: {}", dynamic_count));
+                                        if let Some([idx, _]) = state.grabbed_body {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(60, 240, 120),
+                                                format!("Holding body #{}", idx),
                                             );
-                                        }
-                                        ParticleSpawnType::Matter => {
-                                            if !pool.eject_from_grid_dirty(
-                                                &mut chunk_world,
-                                                &mut dirty_rects,
-                                                cursor.x,
-                                                cursor.y,
-                                                vel,
-                                            ) {
-                                                let mut atom = Atom::new_with_rng(
-                                                    state.selected_material_id,
-                                                    &materials,
-                                                    &mut fastrand::Rng::new(),
-                                                );
-                                                atom.set_free_falling(true);
-                                                atom.set_life_5bit(0);
-                                                pool.push_particle(Particle::new(spawn_pos, vel, atom));
-                                            }
-                                        }
-                                        ParticleSpawnType::Explosion => {
-                                            let r = state.particle_burst_radius.clamp(1, 16);
-                                            for pt in circle_points(cursor, r) {
-                                                let dx = pt.x as f32 - cursor.x as f32;
-                                                let dy = pt.y as f32 - cursor.y as f32;
-                                                let dist = (dx * dx + dy * dy).sqrt().max(0.2);
-                                                let speed = (state.particle_speed * 0.5)
-                                                    + fastrand::f32() * (state.particle_speed * 0.8);
-                                                let bvel = [dx / dist * speed, dy / dist * speed];
-                                                pool.eject_from_grid_dirty(
-                                                    &mut chunk_world,
-                                                    &mut dirty_rects,
-                                                    pt.x,
-                                                    pt.y,
-                                                    bvel,
-                                                );
-                                            }
+                                        } else {
+                                            ui.small("Click on any dynamic body in the world to pick it up.");
                                         }
                                     }
-                                }
+                                });
+                            }
+                            DebugToolMode::ParticleEmitter => {
+                                ui.group(|ui| {
+                                    ui.strong("✨ Particle Emitter Tool");
+                                    ui.small("Left-Click: Emit Particles | Right-Click: Explosion Burst");
+                                    if ui.button("Open Full Particle Settings ➡").clicked() {
+                                        state.selected_tab = DebugTab::Particles;
+                                    }
+                                });
                             }
                         }
-                    });
 
-                    if active_count > 0 {
-                        ui.separator();
-                        egui::CollapsingHeader::new(format!(
-                            "Active Particle Telemetry Sample ({})",
-                            active_count.min(8)
-                        ))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            if let Some(ref pool) = particle_pool {
-                                for (i, p) in pool.particles().iter().take(8).enumerate() {
-                                    let life = p.atom.life_5bit();
-                                    let (rgba, desc) = if p.atom.material_id != 0 {
-                                        (
-                                            Atom::material_preview_color(p.atom.material_id),
-                                            format!("Matter ({})", Atom::material_name(p.atom.material_id)),
-                                        )
-                                    } else {
-                                        let c = if p.atom.color[3] != 0 {
-                                            p.atom.color
-                                        } else {
-                                            [255, 255, 255, 255]
-                                        };
-                                        (c, format!("FX (life={})", life))
-                                    };
+                        ui.add_space(4.0);
+
+                        // --- Cursor Inspector Card ---
+                        ui.group(|ui| {
+                            ui.strong("🔍 Cursor Inspector");
+                            if let (Some(global), Some(cp)) = (cursor_global, cursor_chunk_pos) {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "World: ({}, {}) | Chunk: ({}, {}) [{}, {}]",
+                                        global.x, global.y, cp.chunk.x, cp.chunk.y, cp.atom.x, cp.atom.y
+                                    ));
+                                    if let Some(cursor) = cursor_world {
+                                        if ui.small_button("🎯 Teleport Here").clicked() {
+                                            state.teleport_player_pos = Some(cursor);
+                                        }
+                                    }
+                                });
+                                if let Some(atom) = hovered_atom {
                                     ui.horizontal(|ui| {
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(10.0, 10.0),
-                                            egui::Sense::hover(),
-                                        );
+                                        let [r, g, b, a] = if atom.is_void() {
+                                            [30, 32, 42, 255]
+                                        } else {
+                                            atom.color
+                                        };
+                                        let (rect, _) =
+                                            ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                                         ui.painter().rect_filled(
                                             rect,
                                             2.0,
-                                            egui::Color32::from_rgb(rgba[0], rgba[1], rgba[2]),
+                                            egui::Color32::from_rgba_unmultiplied(r, g, b, a),
                                         );
-                                        ui.small(format!(
-                                            "#{}: pos=({:.1}, {:.1}) | vel=({:.2}, {:.2}) | {}",
-                                            i, p.pos[0], p.pos[1], p.vel[0], p.vel[1], desc
+                                        ui.label(format!(
+                                            "#{} {} ({:?}) vel=({},{}) moving={}",
+                                            atom.material_id,
+                                            Atom::material_name(atom.material_id),
+                                            atom.state(),
+                                            atom.vx,
+                                            atom.vy,
+                                            atom.moving()
                                         ));
                                     });
-                                }
-                            }
-                        });
-                    }
-
-                    ui.separator();
-                    ui.heading("Dynamic Rigidbodies & Physics");
-                    if let Some(ref phys) = rapier_physics {
-                        let active_bodies = phys.bodies.len();
-                        let chunk_colliders = phys.chunk_colliders.len();
-                        ui.label(format!("Dynamic Bodies: {} | Terrain Chunk Colliders: {}", active_bodies, chunk_colliders));
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("📦 Spawn Wooden Crate (C)").clicked() {
-                            state.spawn_crate_requested = true;
-                        }
-                        if ui.button("🪨 Spawn Stone Boulder (B)").clicked() {
-                            state.spawn_boulder_requested = true;
-                        }
-                        if ui.button("🪐 Open Physics Tab ➡").clicked() {
-                            state.selected_tab = DebugTab::Physics;
-                        }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut state.show_rapier_colliders, "Show Dynamic Colliders (Cyan)");
-                        ui.checkbox(&mut state.show_rapier_terrain, "Show Terrain Colliders (Orange)");
-                        ui.checkbox(&mut state.show_rapier_velocities, "Show Velocities (Yellow)");
-                    });
-                }
-
-                DebugTab::Simulation => {
-                    ui.heading("Simulation Controls");
-                    ui.horizontal(|ui| {
-                        let pause_label = if sim_settings.paused {
-                            "▶ Resume (P)"
-                        } else {
-                            "⏸ Pause (P)"
-                        };
-                        if ui.button(pause_label).clicked() {
-                            sim_settings.paused = !sim_settings.paused;
-                        }
-                        if ui
-                            .add_enabled(sim_settings.paused, egui::Button::new("⏭ Step 1 Frame"))
-                            .clicked()
-                        {
-                            sim_settings.step_once = true;
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Steps / Frame:");
-                        ui.add(egui::Slider::new(&mut sim_settings.steps_per_frame, 1..=4));
-                        ui.checkbox(&mut sim_settings.stream_chunks, "Stream Chunks");
-                    });
-
-                    ui.separator();
-                    ui.heading("Camera Controls");
-                    ui.horizontal(|ui| {
-                        ui.label("Zoom (View Height):");
-                        ui.add(
-                            egui::Slider::new(&mut state.camera_height, 64.0..=1800.0)
-                                .logarithmic(true)
-                                .suffix(" px"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Presets:");
-                        for (label, h) in [
-                            ("Close (180)", 180.0),
-                            ("Normal (240)", 240.0),
-                            ("Wide (420)", 420.0),
-                            ("Full (800)", 800.0),
-                        ] {
-                            if ui.small_button(label).clicked() {
-                                state.camera_height = h;
-                            }
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        if let Some(ref mut li) = local_input {
-                            ui.checkbox(&mut li.camera_follow_player, "Camera Follow Player");
-                        }
-                        if ui.button("🎯 Snap Camera to Player").clicked() {
-                            state.reset_camera_requested = true;
-                        }
-                    });
-                    ui.small("Move: A/D | Jump: Space/W | Jetpack: Shift/Space | Zoom: Scroll | Free Pan: Middle-Drag");
-
-                    ui.separator();
-                    ui.heading("Debug Overlays");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut state.show_actor_debug, "Actor Hitbox & Aim");
-                        ui.checkbox(&mut state.show_rapier_colliders, "Rapier Dynamic Colliders");
-                        ui.checkbox(&mut state.show_rapier_terrain, "Rapier Terrain Colliders");
-                        ui.checkbox(&mut state.show_rapier_velocities, "Rapier Velocities");
-                        ui.checkbox(&mut state.show_rapier_aabbs, "Rapier AABBs");
-                        ui.checkbox(&mut state.show_rapier_contacts, "Rapier Contacts");
-                        ui.checkbox(&mut state.show_dirty_rects, "Dirty Rects");
-                        ui.checkbox(&mut state.show_chunk_grid, "Chunk Grid");
-                        ui.checkbox(&mut state.show_brush_cursor, "Brush Cursor");
-                        ui.checkbox(&mut state.show_particles_overlay, "Particles Overlay");
-                    });
-                }
-
-                DebugTab::Player => {
-                    ui.heading("Local Player & KinematicActor");
-                    let mut found_player = false;
-                    for (ent, (ctrl, actor)) in entities.iter_with((&player_controlled, &actors)) {
-                        if ctrl.player_id == local_view.local_player_id {
-                            found_player = true;
-                            let input = match_inputs.players[ctrl.player_id as usize];
-                            let st = actor_states.get(ent).copied().unwrap_or_default();
-                            ui.small(format!(
-                                "Player #{} | pos=({:.2}, {:.2}) | vel=({:.2}, {:.2})",
-                                ctrl.player_id, actor.pos.x, actor.pos.y, actor.vel.x, actor.vel.y
-                            ));
-                            ui.small(format!(
-                                "grounded={} | coyote={}t | normal=({:.2}, {:.2}) | buried={}t",
-                                actor.grounded,
-                                st.coyote_ticks,
-                                actor.ground_normal.x,
-                                actor.ground_normal.y,
-                                st.buried_ticks
-                            ));
-                            ui.small(format!(
-                                "fuel={:.1}/{:.0} | slot={} | aim=({:.2}, {:.2}) | cd={}t",
-                                st.jetpack_fuel,
-                                st.max_jetpack_fuel,
-                                input.selected_slot,
-                                input.aim_dir[0],
-                                input.aim_dir[1],
-                                st.fire_cooldown_ticks
-                            ));
-                            break;
-                        }
-                    }
-                    if !found_player {
-                        ui.small("No local player entity found.");
-                    }
-
-                    ui.horizontal(|ui| {
-                        if let Some(ref mut li) = local_input {
-                            ui.checkbox(&mut li.camera_follow_player, "Camera Follow Player");
-                        }
-                        if ui.button("Respawn at Surface").clicked() {
-                            state.respawn_player_requested = true;
-                        }
-                    });
-                }
-
-                DebugTab::WorldGen => {
-                    ui.heading("Persistence & Storage");
-                    ui.horizontal(|ui| {
-                        if ui.button("💾 Save All Chunks (redb)").clicked() {
-                            chunk_world.save_all_chunks(&io_worker);
-                        }
-                        ui.label(format!("I/O Queue: {}", io_worker.pending_loads.len()));
-                    });
-
-                    ui.separator();
-                    ui.heading("Procedural Generator Settings");
-                    let draft = &mut state.gen_draft;
-                    ui.horizontal(|ui| {
-                        ui.label("Seed:");
-                        ui.add(egui::DragValue::new(&mut draft.seed).speed(1.0));
-                        if ui.small_button("Random").clicked() {
-                            draft.seed = fastrand::u32(..);
-                        }
-                    });
-                    ui.add(
-                        egui::Slider::new(&mut draft.scale, 128.0..=40960.0)
-                            .text("Feature Scale")
-                            .suffix(" px"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut draft.surface_level, -1024..=0)
-                            .text("Surface Level (Y)"),
-                    );
-                    ui.add(egui::Slider::new(&mut draft.hill_amplitude, 0.0..=1600.0).text("Hills"));
-                    ui.add(
-                        egui::Slider::new(&mut draft.mountain_amplitude, 0.0..=2400.0)
-                            .text("Mountains"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut draft.cave_density, 0.0..=20.0).text("Cave Density"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut draft.cave_fade_depth, 1.0..=2000.0)
-                            .text("Cave Surface Fade"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut draft.ore_richness, 0.0..=5.0)
-                            .text("Ore Richness (Quantity)"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut draft.ore_blob_size, 0.2..=5.0)
-                            .text("Ore Blob Size"),
-                    );
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Reset Defaults").clicked() {
-                            state.gen_draft = Generator::default_config();
-                        }
-                        if ui.button("🔄 Regenerate Active Window").clicked() {
-                            *generator = state.gen_draft;
-                            let hook = generator.create_hook();
-                            if let Some(ref mut gh) = generator_hook {
-                                **gh = hook.clone();
-                            }
-                            chunk_world.regenerate_window(
-                                &materials,
-                                &hook,
-                                &mut dirty_rects,
-                            );
-                            stamp_initial_window_prefabs(
-                                &mut chunk_world,
-                                &mut dirty_rects,
-                                &mut prefab_configs,
-                                &mut prefab_placed,
-                                &mut pending_stamps,
-                                &materials,
-                                generator.seed,
-                            );
-                        }
-                    });
-                }
-
-                DebugTab::Physics => {
-                    ui.heading("🪐 Rapier2D Physics Inspector");
-                    if let Some(ref phys) = rapier_physics {
-                        let total_bodies = phys.bodies.len();
-                        let awake_bodies = phys
-                            .bodies
-                            .iter()
-                            .filter(|(_, b)| b.is_dynamic() && !b.is_sleeping())
-                            .count();
-                        let sleeping_bodies = total_bodies.saturating_sub(awake_bodies);
-                        let total_colliders = phys.colliders.len();
-                        let terrain_colliders = phys.chunk_colliders.len();
-                        let dynamic_colliders = total_colliders.saturating_sub(terrain_colliders);
-
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "Bodies: {} ({} awake, {} asleep)",
-                                total_bodies, awake_bodies, sleeping_bodies
-                            ));
-                            ui.separator();
-                            ui.label(format!(
-                                "Colliders: {} ({} dynamic, {} terrain)",
-                                total_colliders, dynamic_colliders, terrain_colliders
-                            ));
-                        });
-
-                        ui.separator();
-                        ui.heading("Debug Visualization Overlays");
-                        ui.horizontal_wrapped(|ui| {
-                            ui.checkbox(&mut state.show_rapier_colliders, "📦 Dynamic Colliders (Cyan)");
-                            ui.checkbox(&mut state.show_rapier_terrain, "⛰ Terrain Colliders (Orange)");
-                            ui.checkbox(&mut state.show_rapier_velocities, "⚡ Velocity Arrows (Yellow)");
-                            ui.checkbox(&mut state.show_rapier_aabbs, "🔲 Collider AABBs (Red)");
-                            ui.checkbox(&mut state.show_rapier_contacts, "💥 Contacts & Normals");
-                        });
-
-                        ui.separator();
-                        ui.heading("Physics Actions & Spawners");
-                        ui.horizontal(|ui| {
-                            let is_grab = matches!(state.tool_mode, DebugToolMode::PhysicsGrab);
-                            if ui.selectable_label(is_grab, "🧲 Grab Tool").clicked() {
-                                state.tool_mode = if is_grab {
-                                    DebugToolMode::PlayerTool
                                 } else {
-                                    DebugToolMode::PhysicsGrab
-                                };
-                            }
-                            if ui.button("📦 Crate (C)").clicked() {
-                                state.spawn_crate_requested = true;
-                            }
-                            if ui.button("🪨 Boulder (B)").clicked() {
-                                state.spawn_boulder_requested = true;
-                            }
-                            if ui.button("⏰ Wake All").clicked() {
-                                state.wake_all_bodies_requested = true;
-                            }
-                            if ui.button("💤 Sleep All").clicked() {
-                                state.sleep_all_bodies_requested = true;
+                                    ui.label("Atom: <unloaded chunk>");
+                                }
+                            } else {
+                                ui.label("Cursor: <outside window>");
                             }
                         });
-                        ui.horizontal(|ui| {
-                            let selected_prefab_name = prefab_configs
-                                .0
-                                .get(state.selected_prefab_idx)
-                                .map(|p| p.display_name.as_str())
-                                .unwrap_or("None");
+                    }
 
-                            if ui
-                                .button(format!("🏗 Spawn Prefab Rigidbody ({})", selected_prefab_name))
-                                .clicked()
-                            {
-                                state.spawn_prefab_rigidbody_requested = true;
-                            }
+                    DebugTab::Physics => {
+                        ui.heading("🪐 Rapier2D Physics Inspector");
+                        if let Some(ref phys) = rapier_physics {
+                            let total_bodies = phys.bodies.len();
+                            let awake_bodies = phys
+                                .bodies
+                                .iter()
+                                .filter(|(_, b)| b.is_dynamic() && !b.is_sleeping())
+                                .count();
+                            let sleeping_bodies = total_bodies.saturating_sub(awake_bodies);
+                            let total_colliders = phys.colliders.len();
+                            let terrain_colliders = phys.chunk_colliders.len();
+                            let dynamic_colliders = total_colliders.saturating_sub(terrain_colliders);
 
-                            egui::ComboBox::from_id_salt("physics_prefab_select")
-                                .selected_text(selected_prefab_name)
-                                .show_ui(ui, |ui| {
-                                    for (idx, p) in prefab_configs.0.iter().enumerate() {
-                                        ui.selectable_value(&mut state.selected_prefab_idx, idx, &p.display_name);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Bodies: {} ({} awake, {} asleep)",
+                                        total_bodies, awake_bodies, sleeping_bodies
+                                    ))
+                                    .strong(),
+                                );
+                                ui.separator();
+                                ui.label(format!(
+                                    "Colliders: {} ({} dynamic, {} terrain)",
+                                    total_colliders, dynamic_colliders, terrain_colliders
+                                ));
+                            });
+
+                            ui.add_space(4.0);
+
+                            // --- Spawners Card ---
+                            ui.group(|ui| {
+                                ui.strong("📦 Rigidbody Spawners");
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut state.spawn_at_cursor, "Spawn at Cursor (uncheck for player pos)");
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("📦 Crate 16x16 (C)").clicked() {
+                                        state.spawn_crate_requested = true;
+                                    }
+                                    if ui.button("📦 Big Crate 24x24").clicked() {
+                                        state.spawn_preset_crate_big_requested = true;
+                                    }
+                                    if ui.button("🪨 Boulder 16x16 (B)").clicked() {
+                                        state.spawn_boulder_requested = true;
+                                    }
+                                    if ui.button("🪨 Heavy Boulder 32x32").clicked() {
+                                        state.spawn_preset_boulder_heavy_requested = true;
+                                    }
+                                    if ui.button("🪵 Plank 32x8").clicked() {
+                                        state.spawn_preset_plank_requested = true;
+                                    }
+                                    if ui.button("🔩 Metal Beam 32x8").clicked() {
+                                        state.spawn_preset_metal_beam_requested = true;
+                                    }
+                                    if ui.button("🧊 Ice Block 16x16").clicked() {
+                                        state.spawn_preset_ice_requested = true;
                                     }
                                 });
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.button("🧹 Clear All Dynamic Bodies").clicked() {
-                                state.clear_all_bodies_requested = true;
-                            }
-                            if ui.button("🔄 Rebuild Terrain Colliders").clicked() {
-                                state.rebuild_terrain_colliders_requested = true;
-                            }
-                        });
 
-                        ui.separator();
-                        egui::CollapsingHeader::new(format!("Dynamic Rigidbodies ({})", total_bodies))
-                            .default_open(true)
+                                ui.add_space(2.0);
+                                egui::CollapsingHeader::new("🔨 Custom Box Spawner")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Width:");
+                                            ui.add(egui::Slider::new(&mut state.custom_rb_width, 4..=64).suffix(" px"));
+                                            ui.label("Height:");
+                                            ui.add(egui::Slider::new(&mut state.custom_rb_height, 4..=64).suffix(" px"));
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Material:");
+                                            let [mr, mg, mb, _] = Atom::material_preview_color(state.custom_rb_material_id);
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(mr, mg, mb));
+                                            let cur_mat_name = Atom::material_name(state.custom_rb_material_id);
+                                            egui::ComboBox::from_id_salt("custom_rb_mat_select")
+                                                .selected_text(cur_mat_name)
+                                                .show_ui(ui, |ui| {
+                                                    for &id in &[12_u8, 8, 14, 15, 3, 2, 7, 4] {
+                                                        let [r, g, b, _] = Atom::material_preview_color(id);
+                                                        ui.horizontal(|ui| {
+                                                            let (r_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                                            ui.painter().rect_filled(r_rect, 2.0, egui::Color32::from_rgb(r, g, b));
+                                                            ui.selectable_value(&mut state.custom_rb_material_id, id, Atom::material_name(id));
+                                                        });
+                                                    }
+                                                });
+                                            if ui.button("Spawn Custom Box").clicked() {
+                                                state.spawn_custom_box_requested = true;
+                                            }
+                                        });
+                                    });
+
+                                ui.horizontal(|ui| {
+                                    let selected_prefab_name = prefab_configs
+                                        .0
+                                        .get(state.selected_prefab_idx)
+                                        .map(|p| p.display_name.as_str())
+                                        .unwrap_or("None");
+
+                                    if ui.button(format!("🏗 Spawn Prefab ({})", selected_prefab_name)).clicked() {
+                                        state.spawn_prefab_rigidbody_requested = true;
+                                    }
+
+                                    egui::ComboBox::from_id_salt("physics_prefab_select")
+                                        .selected_text(selected_prefab_name)
+                                        .show_ui(ui, |ui| {
+                                            for (idx, p) in prefab_configs.0.iter().enumerate() {
+                                                ui.selectable_value(&mut state.selected_prefab_idx, idx, &p.display_name);
+                                            }
+                                        });
+                                });
+                            });
+
+                            ui.add_space(4.0);
+
+                            // --- Gravity & Simulation Lifecycle Card ---
+                            ui.group(|ui| {
+                                ui.strong("⚡ Gravity & World Controls");
+                                ui.horizontal(|ui| {
+                                    ui.label("Gravity Y:");
+                                    ui.add(egui::Slider::new(&mut state.physics_gravity_y, -1960.0..=1960.0).suffix(" px/s²"));
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Gravity Presets:");
+                                    if ui.small_button("Earth (-980)").clicked() {
+                                        state.physics_gravity_y = -980.0;
+                                    }
+                                    if ui.small_button("Moon (-250)").clicked() {
+                                        state.physics_gravity_y = -250.0;
+                                    }
+                                    if ui.small_button("Zero-G (0)").clicked() {
+                                        state.physics_gravity_y = 0.0;
+                                    }
+                                    if ui.small_button("Inverted (+980)").clicked() {
+                                        state.physics_gravity_y = 980.0;
+                                    }
+                                });
+
+                                ui.horizontal_wrapped(|ui| {
+                                    let is_grab = matches!(state.tool_mode, DebugToolMode::PhysicsGrab);
+                                    if ui.selectable_label(is_grab, "🧲 Grab Tool").clicked() {
+                                        state.tool_mode = if is_grab {
+                                            DebugToolMode::PlayerTool
+                                        } else {
+                                            DebugToolMode::PhysicsGrab
+                                        };
+                                    }
+                                    if ui.button("⏰ Wake All").clicked() {
+                                        state.wake_all_bodies_requested = true;
+                                    }
+                                    if ui.button("💤 Sleep All").clicked() {
+                                        state.sleep_all_bodies_requested = true;
+                                    }
+                                    if ui.button("🧹 Clear All Bodies").clicked() {
+                                        state.clear_all_bodies_requested = true;
+                                    }
+                                    if ui.button("🔄 Rebuild Terrain Colliders").clicked() {
+                                        state.rebuild_terrain_colliders_requested = true;
+                                    }
+                                });
+                            });
+
+                            ui.add_space(4.0);
+
+                            // --- Overlays Card ---
+                            ui.group(|ui| {
+                                ui.strong("👁 Physics Overlays");
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(&mut state.show_rapier_colliders, "📦 Dynamic Colliders (Cyan)");
+                                    ui.checkbox(&mut state.show_rapier_terrain, "⛰ Terrain Colliders (Orange)");
+                                    ui.checkbox(&mut state.show_rapier_velocities, "⚡ Velocities (Yellow)");
+                                    ui.checkbox(&mut state.show_rapier_aabbs, "🔲 AABBs (Red)");
+                                    ui.checkbox(&mut state.show_rapier_contacts, "💥 Contacts & Normals");
+                                });
+                            });
+
+                            ui.add_space(4.0);
+
+                            // --- Dynamic Rigidbodies Table ---
+                            egui::CollapsingHeader::new(format!("Active Dynamic Rigidbodies ({})", total_bodies))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    if total_bodies == 0 {
+                                        ui.small("No active dynamic rigidbodies. Press 'C' or 'B' to spawn crates or boulders.");
+                                    } else {
+                                        egui::ScrollArea::vertical()
+                                            .max_height(220.0)
+                                            .show(ui, |ui| {
+                                                let mut delete_target = None;
+                                                for (handle, rb) in phys.bodies.iter() {
+                                                    let (idx, _gen) = handle.into_raw_parts();
+                                                    let pos = from_rapier_vec(rb.translation());
+                                                    let angle_deg = rb.rotation().angle().to_degrees();
+                                                    let vel = from_rapier_vec(rb.linvel());
+                                                    let speed = vel.length();
+                                                    let is_sleeping = rb.is_sleeping();
+
+                                                    ui.group(|ui| {
+                                                        ui.horizontal(|ui| {
+                                                            let status_badge = if is_sleeping {
+                                                                egui::RichText::new("SLEEP")
+                                                                    .color(egui::Color32::from_rgb(140, 150, 170))
+                                                            } else {
+                                                                egui::RichText::new("AWAKE")
+                                                                    .color(egui::Color32::from_rgb(60, 240, 120))
+                                                            };
+                                                            ui.strong(format!("#{}", idx));
+                                                            ui.label(status_badge);
+                                                            ui.label(format!("pos: ({:.1}, {:.1}) | rot: {:.0}°", pos.x, pos.y, angle_deg));
+                                                            ui.label(format!("vel: {:.1} px/s", speed));
+                                                            ui.label(format!("mass: {:.1}", rb.mass()));
+
+                                                            if ui.small_button("🎯 Focus").clicked() {
+                                                                state.focus_world_pos = Some(pos);
+                                                            }
+                                                            if ui.small_button("❌ Del").clicked() {
+                                                                delete_target = Some(idx);
+                                                            }
+                                                        });
+                                                    });
+                                                }
+                                                if let Some(target) = delete_target {
+                                                    state.delete_body_requested = Some(target);
+                                                }
+                                            });
+                                    }
+                                });
+
+                            // --- Terrain Colliders Collapsing Header ---
+                            egui::CollapsingHeader::new(format!(
+                                "Active Terrain Chunk Colliders ({})",
+                                terrain_colliders
+                            ))
+                            .default_open(false)
                             .show(ui, |ui| {
-                                if total_bodies == 0 {
-                                    ui.small("No active dynamic rigidbodies. Press 'C' or 'B' to spawn crates or boulders.");
+                                if terrain_colliders == 0 {
+                                    ui.small("No static terrain chunk colliders currently active.");
                                 } else {
                                     egui::ScrollArea::vertical()
-                                        .max_height(240.0)
+                                        .max_height(140.0)
                                         .show(ui, |ui| {
-                                            let mut delete_target = None;
-                                            for (handle, rb) in phys.bodies.iter() {
-                                                let (idx, _gen) = handle.into_raw_parts();
-                                                let pos = from_rapier_vec(rb.translation());
-                                                let angle_deg = rb.rotation().angle().to_degrees();
-                                                let vel = from_rapier_vec(rb.linvel());
-                                                let speed = vel.length();
-                                                let is_sleeping = rb.is_sleeping();
-
-                                                ui.group(|ui| {
-                                                    ui.horizontal(|ui| {
-                                                        let status_badge = if is_sleeping {
-                                                            egui::RichText::new("SLEEP")
-                                                                .color(egui::Color32::from_rgb(140, 150, 170))
-                                                        } else {
-                                                            egui::RichText::new("AWAKE")
-                                                                .color(egui::Color32::from_rgb(60, 240, 120))
-                                                        };
-                                                        ui.strong(format!("#{}", idx));
-                                                        ui.label(status_badge);
-                                                        ui.label(format!("pos: ({:.1}, {:.1})", pos.x, pos.y));
-                                                        ui.label(format!("rot: {:.1}°", angle_deg));
-                                                        ui.label(format!(
-                                                            "vel: ({:.1}, {:.1}) [{:.1} px/s]",
-                                                            vel.x, vel.y, speed
-                                                        ));
-                                                        ui.label(format!("mass: {:.1}", rb.mass()));
-
-                                                        if ui.small_button("❌ Delete").clicked() {
-                                                            delete_target = Some(idx);
-                                                        }
-                                                    });
-                                                });
-                                            }
-                                            if let Some(target) = delete_target {
-                                                state.delete_body_requested = Some(target);
-                                            }
+                                            ui.horizontal_wrapped(|ui| {
+                                                for &(cx, cy) in phys.chunk_colliders.keys() {
+                                                    let min_x = cx * CHUNK_SIZE as i32;
+                                                    let max_x = min_x + CHUNK_SIZE as i32;
+                                                    let top_y = -(cy * CHUNK_SIZE as i32);
+                                                    let bot_y = top_y - CHUNK_SIZE as i32;
+                                                    ui.label(format!(
+                                                        "Chunk ({}, {}) [X:{}..{}, Y:{}..{}]",
+                                                        cx, cy, min_x, max_x, bot_y, top_y
+                                                    ));
+                                                }
+                                            });
                                         });
                                 }
                             });
+                        } else {
+                            ui.label("RapierPhysics resource not loaded in active session.");
+                        }
+                    }
+
+                    DebugTab::Particles => {
+                        ui.heading("Particle Pool Status");
+                        let active_count = particle_pool.as_ref().map(|p| p.len()).unwrap_or(0);
+                        let matter_count = particle_pool
+                            .as_ref()
+                            .map(|p| {
+                                p.particles()
+                                    .iter()
+                                    .filter(|pt| pt.atom.life_5bit() == 0)
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        let fx_count = active_count.saturating_sub(matter_count);
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Active: {} / {}",
+                                    active_count, MAX_PARTICLES
+                                ))
+                                .strong(),
+                            );
+                            ui.separator();
+                            ui.label(format!("Matter: {}", matter_count));
+                            ui.separator();
+                            ui.label(format!("FX: {}", fx_count));
+                        });
+
+                        let fill_ratio = active_count as f32 / MAX_PARTICLES as f32;
+                        ui.add(
+                            egui::ProgressBar::new(fill_ratio)
+                                .text(format!("{:.1}% Capacity", fill_ratio * 100.0)),
+                        );
+
+                        ui.horizontal(|ui| {
+                            if ui.button("🧹 Clear All Particles").clicked() {
+                                if let Some(ref mut pool) = particle_pool {
+                                    pool.clear();
+                                }
+                            }
+                            ui.checkbox(&mut state.show_particles_overlay, "Show Particles Overlay");
+                        });
 
                         ui.separator();
-                        egui::CollapsingHeader::new(format!(
-                            "Active Terrain Chunk Colliders ({})",
-                            terrain_colliders
-                        ))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            if terrain_colliders == 0 {
-                                ui.small("No static terrain chunk colliders currently active.");
+                        ui.heading("Particle Emitter Tool");
+                        ui.horizontal(|ui| {
+                            let is_active = matches!(state.tool_mode, DebugToolMode::ParticleEmitter);
+                            let label = if is_active {
+                                "✅ Emitter Active (Click World)"
                             } else {
-                                egui::ScrollArea::vertical()
-                                    .max_height(180.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal_wrapped(|ui| {
-                                            for &(cx, cy) in phys.chunk_colliders.keys() {
-                                                let min_x = cx * CHUNK_SIZE as i32;
-                                                let max_x = min_x + CHUNK_SIZE as i32;
-                                                let top_y = -(cy * CHUNK_SIZE as i32);
-                                                let bot_y = top_y - CHUNK_SIZE as i32;
-                                                ui.label(format!(
-                                                    "Chunk ({}, {}) [X:{}..{}, Y:{}..{}]",
-                                                    cx, cy, min_x, max_x, bot_y, top_y
-                                                ));
-                                            }
-                                        });
-                                    });
+                                "🎯 Activate World Click Emitter"
+                            };
+                            if ui.selectable_label(is_active, label).clicked() {
+                                state.tool_mode = if is_active {
+                                    DebugToolMode::PlayerTool
+                                } else {
+                                    DebugToolMode::ParticleEmitter
+                                };
                             }
                         });
-                    } else {
-                        ui.label("RapierPhysics resource not loaded in active session.");
+
+                        ui.horizontal(|ui| {
+                            ui.label("Mode:");
+                            ui.selectable_value(&mut state.particle_spawn_type, ParticleSpawnType::Fx, "✨ Ephemeral FX");
+                            ui.selectable_value(&mut state.particle_spawn_type, ParticleSpawnType::Matter, "⛏ Real Matter");
+                            ui.selectable_value(&mut state.particle_spawn_type, ParticleSpawnType::Explosion, "💣 Explosion");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Speed:");
+                            ui.add(egui::Slider::new(&mut state.particle_speed, 0.5..=24.0).suffix(" px/t"));
+                            ui.label("Spread:");
+                            ui.add(egui::Slider::new(&mut state.particle_spread_deg, 0.0..=90.0).suffix("°"));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Angle:");
+                            ui.add(egui::Slider::new(&mut state.particle_angle_deg, -180.0..=180.0).suffix("°"));
+                        });
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Quick Aim:");
+                            if ui.small_button("⬆ Up").clicked() { state.particle_angle_deg = -90.0; }
+                            if ui.small_button("↗ Up-Right").clicked() { state.particle_angle_deg = -45.0; }
+                            if ui.small_button("➡ Right").clicked() { state.particle_angle_deg = 0.0; }
+                            if ui.small_button("↘ Down-Right").clicked() { state.particle_angle_deg = 45.0; }
+                            if ui.small_button("⬇ Down").clicked() { state.particle_angle_deg = 90.0; }
+                            if ui.small_button("⬅ Left").clicked() { state.particle_angle_deg = 180.0; }
+                        });
+
+                        ui.checkbox(
+                            &mut state.particle_continuous_fountain,
+                            "⛲ Continuous stream while holding Left-Click",
+                        );
+
+                        match state.particle_spawn_type {
+                            ParticleSpawnType::Fx => {
+                                ui.separator();
+                                ui.label("Ephemeral FX Settings:");
+                                ui.horizontal(|ui| {
+                                    ui.label("Lifetime:");
+                                    ui.add(egui::Slider::new(&mut state.particle_fx_lifetime, 1..=31).suffix(" ticks"));
+                                    ui.checkbox(&mut state.particle_fx_bounces, "Bouncing (FLAG_PARTICLE_BOUNCE)");
+                                });
+
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Presets:");
+                                    if ui.small_button("🔥 Spark").clicked() {
+                                        state.particle_fx_color = [255, 180, 40, 255];
+                                        state.particle_fx_bounces = true;
+                                    }
+                                    if ui.small_button("💧 Foam").clicked() {
+                                        state.particle_fx_color = [80, 200, 255, 230];
+                                        state.particle_fx_bounces = false;
+                                    }
+                                    if ui.small_button("💨 Smoke").clicked() {
+                                        state.particle_fx_color = [180, 180, 190, 200];
+                                        state.particle_fx_bounces = false;
+                                    }
+                                    if ui.small_button("🟢 Acid").clicked() {
+                                        state.particle_fx_color = [50, 240, 60, 220];
+                                        state.particle_fx_bounces = true;
+                                    }
+                                    if ui.small_button("🟣 Plasma").clicked() {
+                                        state.particle_fx_color = [220, 80, 255, 255];
+                                        state.particle_fx_bounces = true;
+                                    }
+                                    if ui.small_button("⚡ Electric").clicked() {
+                                        state.particle_fx_color = [120, 220, 255, 255];
+                                        state.particle_fx_bounces = true;
+                                    }
+                                    if ui.small_button("❄ Ice").clicked() {
+                                        state.particle_fx_color = [200, 240, 255, 220];
+                                        state.particle_fx_bounces = false;
+                                    }
+                                });
+
+                                let mut c = egui::Color32::from_rgba_unmultiplied(
+                                    state.particle_fx_color[0],
+                                    state.particle_fx_color[1],
+                                    state.particle_fx_color[2],
+                                    state.particle_fx_color[3],
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("FX Color:");
+                                    let (swatch_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(14.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(swatch_rect, 2.0, c);
+                                    if egui::color_picker::color_edit_button_srgba(
+                                        ui,
+                                        &mut c,
+                                        egui::color_picker::Alpha::Opaque,
+                                    )
+                                    .changed()
+                                    {
+                                        state.particle_fx_color = [c.r(), c.g(), c.b(), c.a()];
+                                    }
+                                });
+                            }
+                            ParticleSpawnType::Matter => {
+                                ui.separator();
+                                ui.small("Click on solid/powder/liquid cells in the world to eject them, or click air to emit the selected material below:");
+                                ui.horizontal(|ui| {
+                                    ui.label("Material in Air:");
+                                    let [mr, mg, mb, _] =
+                                        Atom::material_preview_color(state.selected_material_id);
+                                    let (swatch_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(14.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        swatch_rect,
+                                        2.0,
+                                        egui::Color32::from_rgb(mr, mg, mb),
+                                    );
+                                    let curr_name = Atom::material_name(state.selected_material_id);
+                                    egui::ComboBox::from_id_salt("particle_matter_select")
+                                        .selected_text(curr_name)
+                                        .show_ui(ui, |ui| {
+                                            for &id in &Atom::PAINTABLE_MATERIAL_IDS {
+                                                if id != 0 {
+                                                    let [r, g, b, _] = Atom::material_preview_color(id);
+                                                    ui.horizontal(|ui| {
+                                                        let (rect, _) = ui.allocate_exact_size(
+                                                            egui::vec2(10.0, 10.0),
+                                                            egui::Sense::hover(),
+                                                        );
+                                                        ui.painter().rect_filled(
+                                                            rect,
+                                                            2.0,
+                                                            egui::Color32::from_rgb(r, g, b),
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut state.selected_material_id,
+                                                            id,
+                                                            Atom::material_name(id),
+                                                        );
+                                                    });
+                                                }
+                                            }
+                                        });
+                                });
+                            }
+                            ParticleSpawnType::Explosion => {
+                                ui.separator();
+                                ui.label("Explosion Settings:");
+                                ui.horizontal(|ui| {
+                                    ui.label("Blast Radius:");
+                                    ui.add(egui::Slider::new(&mut state.particle_burst_radius, 1..=24).suffix(" px"));
+                                });
+                                ui.small("Clicking the world detonate-ejects all terrain atoms within radius radially outwards!");
+                            }
+                        }
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if let Some(cursor) = cursor_global {
+                                if ui.button("💥 Trigger at Cursor").clicked() {
+                                    if let Some(ref mut pool) = particle_pool {
+                                        let rad = state.particle_angle_deg.to_radians();
+                                        let vel = [rad.cos() * state.particle_speed, rad.sin() * state.particle_speed];
+                                        let spawn_pos = [cursor.x as f32 + 0.5, cursor.y as f32 + 0.5];
+                                        match state.particle_spawn_type {
+                                            ParticleSpawnType::Fx => {
+                                                pool.spawn_fx(
+                                                    spawn_pos,
+                                                    vel,
+                                                    state.particle_fx_color,
+                                                    state.particle_fx_lifetime,
+                                                    state.particle_fx_bounces,
+                                                );
+                                            }
+                                            ParticleSpawnType::Matter => {
+                                                if !pool.eject_from_grid_dirty(
+                                                    &mut chunk_world,
+                                                    &mut dirty_rects,
+                                                    cursor.x,
+                                                    cursor.y,
+                                                    vel,
+                                                ) {
+                                                    let mut atom = Atom::new_with_rng(
+                                                        state.selected_material_id,
+                                                        &materials,
+                                                        &mut fastrand::Rng::new(),
+                                                    );
+                                                    atom.set_free_falling(true);
+                                                    atom.set_life_5bit(0);
+                                                    pool.push_particle(Particle::new(spawn_pos, vel, atom));
+                                                }
+                                            }
+                                            ParticleSpawnType::Explosion => {
+                                                let r = state.particle_burst_radius.clamp(1, 24);
+                                                for pt in circle_points(cursor, r) {
+                                                    let dx = pt.x as f32 - cursor.x as f32;
+                                                    let dy = pt.y as f32 - cursor.y as f32;
+                                                    let dist = (dx * dx + dy * dy).sqrt().max(0.2);
+                                                    let speed = (state.particle_speed * 0.5)
+                                                        + fastrand::f32() * (state.particle_speed * 0.8);
+                                                    let bvel = [dx / dist * speed, dy / dist * speed];
+                                                    pool.eject_from_grid_dirty(
+                                                        &mut chunk_world,
+                                                        &mut dirty_rects,
+                                                        pt.x,
+                                                        pt.y,
+                                                        bvel,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        if active_count > 0 {
+                            ui.separator();
+                            egui::CollapsingHeader::new(format!(
+                                "Active Particle Telemetry Sample ({})",
+                                active_count.min(8)
+                            ))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if let Some(ref pool) = particle_pool {
+                                    for (i, p) in pool.particles().iter().take(8).enumerate() {
+                                        let life = p.atom.life_5bit();
+                                        let (rgba, desc) = if p.atom.material_id != 0 {
+                                            (
+                                                Atom::material_preview_color(p.atom.material_id),
+                                                format!("Matter ({})", Atom::material_name(p.atom.material_id)),
+                                            )
+                                        } else {
+                                            let c = if p.atom.color[3] != 0 {
+                                                p.atom.color
+                                            } else {
+                                                [255, 255, 255, 255]
+                                            };
+                                            (c, format!("FX (life={})", life))
+                                        };
+                                        ui.horizontal(|ui| {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(10.0, 10.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                2.0,
+                                                egui::Color32::from_rgb(rgba[0], rgba[1], rgba[2]),
+                                            );
+                                            ui.small(format!(
+                                                "#{}: pos=({:.1}, {:.1}) | vel=({:.2}, {:.2}) | {}",
+                                                i, p.pos[0], p.pos[1], p.vel[0], p.vel[1], desc
+                                            ));
+                                        });
+                                    }
+                                }
+                            });
+                        }
                     }
-                }
-            }
+
+                    DebugTab::Player => {
+                        ui.heading("🏃 Player & Actor Inspector");
+                        let mut found_player = false;
+                        for (ent, (ctrl, actor)) in entities.iter_with((&player_controlled, &actors)) {
+                            if ctrl.player_id == local_view.local_player_id {
+                                found_player = true;
+                                let input = match_inputs.players[ctrl.player_id as usize];
+                                let st = actor_states.get(ent).copied().unwrap_or_default();
+
+                                ui.group(|ui| {
+                                    ui.strong(format!("Player #{} Telemetry", ctrl.player_id));
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("Position: ({:.2}, {:.2})", actor.pos.x, actor.pos.y));
+                                        ui.separator();
+                                        ui.label(format!(
+                                            "Velocity: ({:.2}, {:.2}) [{:.1} px/t]",
+                                            actor.vel.x, actor.vel.y, actor.vel.length()
+                                        ));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        let ground_badge = if actor.grounded {
+                                            egui::RichText::new("GROUNDED")
+                                                .color(egui::Color32::from_rgb(60, 240, 120))
+                                        } else {
+                                            egui::RichText::new("AIRBORNE")
+                                                .color(egui::Color32::from_rgb(100, 180, 255))
+                                        };
+                                        ui.label(ground_badge);
+                                        ui.label(format!("Normal: ({:.2}, {:.2})", actor.ground_normal.x, actor.ground_normal.y));
+                                        ui.label(format!("Coyote: {}t", st.coyote_ticks));
+                                        ui.label(format!("Buried: {}t", st.buried_ticks));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        let fuel_ratio = (st.jetpack_fuel / st.max_jetpack_fuel.max(1.0)).clamp(0.0, 1.0);
+                                        ui.label(format!("Jetpack Fuel: {:.0}/{:.0}", st.jetpack_fuel, st.max_jetpack_fuel));
+                                        ui.add(egui::ProgressBar::new(fuel_ratio).show_percentage());
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("Selected Slot: {}", input.selected_slot));
+                                        ui.label(format!("Aim Dir: ({:.2}, {:.2})", input.aim_dir[0], input.aim_dir[1]));
+                                        ui.label(format!("Cooldown: {}t", st.fire_cooldown_ticks));
+                                    });
+                                });
+                                break;
+                            }
+                        }
+                        if !found_player {
+                            ui.small("No local player entity found.");
+                        }
+
+                        ui.add_space(4.0);
+
+                        // --- Cheats & Toggles Card ---
+                        ui.group(|ui| {
+                            ui.strong("⚡ Cheats & Flight");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut state.infinite_fuel, "⚡ Infinite Jetpack Fuel");
+                                ui.checkbox(&mut state.god_mode, "🛡 God Mode (No Buried Penalty)");
+                            });
+                        });
+
+                        ui.add_space(4.0);
+
+                        // --- Teleportation & Movement Card ---
+                        ui.group(|ui| {
+                            ui.strong("🎯 Teleportation & Movement");
+                            ui.horizontal_wrapped(|ui| {
+                                if let Some(cursor) = cursor_world {
+                                    if ui.button("🎯 Teleport to Cursor (T)").clicked() {
+                                        state.teleport_player_pos = Some(cursor);
+                                    }
+                                } else {
+                                    ui.add_enabled(false, egui::Button::new("🎯 Teleport to Cursor (T)"));
+                                }
+                                if ui.button("🏔 Teleport to Surface (Respawn)").clicked() {
+                                    state.respawn_player_requested = true;
+                                }
+                                if ui.button("🛑 Halt Velocity").clicked() {
+                                    state.stop_player_velocity_requested = true;
+                                }
+                            });
+                        });
+
+                        ui.add_space(4.0);
+
+                        // --- Camera Controls Card ---
+                        ui.group(|ui| {
+                            ui.strong("🎥 Camera & Focus");
+                            ui.horizontal(|ui| {
+                                if let Some(ref mut li) = local_input {
+                                    ui.checkbox(&mut li.camera_follow_player, "Camera Follow Player");
+                                }
+                                if ui.button("🎯 Snap Camera to Player").clicked() {
+                                    state.reset_camera_requested = true;
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Zoom Presets:");
+                                if ui.small_button("Close (180)").clicked() { state.camera_height = 180.0; }
+                                if ui.small_button("Normal (240)").clicked() { state.camera_height = 240.0; }
+                                if ui.small_button("Wide (420)").clicked() { state.camera_height = 420.0; }
+                                if ui.small_button("Full (800)").clicked() { state.camera_height = 800.0; }
+                            });
+                        });
+                    }
+
+                    DebugTab::WorldGen => {
+                        ui.heading("🌍 World, Persistence & Mass Tools");
+                        ui.group(|ui| {
+                            ui.strong("💾 Storage & Persistence");
+                            ui.horizontal(|ui| {
+                                if ui.button("💾 Save All Chunks (redb)").clicked() {
+                                    chunk_world.save_all_chunks(&io_worker);
+                                }
+                                ui.label(format!("Loaded Chunks: {}", chunk_world.chunks.len()));
+                                ui.separator();
+                                ui.label(format!("I/O Queue: {}", io_worker.pending_loads.len()));
+                            });
+                        });
+
+                        ui.add_space(4.0);
+
+                        ui.group(|ui| {
+                            ui.strong("🧹 Mass Window Tools (Active Screen)");
+                            ui.small("Instantly alter all atoms in the visible active window for sandbox testing:");
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("🧹 Clear Window to Void (Air)").clicked() {
+                                    state.clear_window_requested = true;
+                                }
+                                if ui.button("🌊 Fill Window with Water").clicked() {
+                                    state.fill_window_water_requested = true;
+                                }
+                                if ui.button("🏖 Fill Window with Sand").clicked() {
+                                    state.fill_window_sand_requested = true;
+                                }
+                            });
+                        });
+
+                        ui.add_space(4.0);
+
+                        ui.group(|ui| {
+                            ui.strong("🏔 Procedural Generator Settings");
+                            let draft = &mut state.gen_draft;
+                            ui.horizontal(|ui| {
+                                ui.label("Seed:");
+                                ui.add(egui::DragValue::new(&mut draft.seed).speed(1.0));
+                                if ui.small_button("🎲 Randomize").clicked() {
+                                    draft.seed = fastrand::u32(..);
+                                }
+                            });
+                            ui.add(
+                                egui::Slider::new(&mut draft.scale, 128.0..=40960.0)
+                                    .text("Feature Scale")
+                                    .suffix(" px"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut draft.surface_level, -1024..=0)
+                                    .text("Surface Level (Y)"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut draft.hill_amplitude, 0.0..=1600.0)
+                                    .text("Hills Amplitude"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut draft.mountain_amplitude, 0.0..=2400.0)
+                                    .text("Mountains Amplitude"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut draft.cave_density, 0.0..=20.0).text("Cave Density"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut draft.cave_fade_depth, 1.0..=2000.0)
+                                    .text("Cave Surface Fade"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut draft.ore_richness, 0.0..=5.0)
+                                    .text("Ore Richness (Quantity)"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut draft.ore_blob_size, 0.2..=5.0)
+                                    .text("Ore Blob Size"),
+                            );
+
+                            ui.horizontal(|ui| {
+                                if ui.button("Reset Defaults").clicked() {
+                                    state.gen_draft = Generator::default_config();
+                                }
+                                if ui.button("🔄 Regenerate Active Window").clicked() {
+                                    *generator = state.gen_draft;
+                                    let hook = generator.create_hook();
+                                    if let Some(ref mut gh) = generator_hook {
+                                        **gh = hook.clone();
+                                    }
+                                    chunk_world.regenerate_window(
+                                        &materials,
+                                        &hook,
+                                        &mut dirty_rects,
+                                    );
+                                    stamp_initial_window_prefabs(
+                                        &mut chunk_world,
+                                        &mut dirty_rects,
+                                        &mut prefab_configs,
+                                        &mut prefab_placed,
+                                        &mut pending_stamps,
+                                        &materials,
+                                        generator.seed,
+                                    );
+                                }
+                            });
+                        });
+                    }
+
+                    DebugTab::Simulation => {
+                        ui.heading("👁 Overlays, Simulation & Camera");
+                        ui.group(|ui| {
+                            ui.strong("⏱ Simulation Speed & Stepping");
+                            ui.horizontal(|ui| {
+                                let pause_label = if sim_settings.paused {
+                                    "▶ Resume (P)"
+                                } else {
+                                    "⏸ Pause (P)"
+                                };
+                                if ui.button(pause_label).clicked() {
+                                    sim_settings.paused = !sim_settings.paused;
+                                }
+                                if ui
+                                    .add_enabled(sim_settings.paused, egui::Button::new("⏭ Step 1 Tick"))
+                                    .clicked()
+                                {
+                                    sim_settings.step_once = true;
+                                }
+                                if ui
+                                    .add_enabled(sim_settings.paused, egui::Button::new("⏩ Step 10 Ticks"))
+                                    .clicked()
+                                {
+                                    state.step_ten_ticks_counter = 10;
+                                }
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("Steps / Frame:");
+                                ui.add(egui::Slider::new(&mut sim_settings.steps_per_frame, 1..=4));
+                                ui.checkbox(&mut sim_settings.stream_chunks, "Stream Chunks");
+                            });
+                        });
+
+                        ui.add_space(4.0);
+
+                        ui.group(|ui| {
+                            ui.strong("🎥 Camera Zoom & Panning");
+                            ui.horizontal(|ui| {
+                                ui.label("Zoom (Height):");
+                                ui.add(
+                                    egui::Slider::new(&mut state.camera_height, 64.0..=1800.0)
+                                        .logarithmic(true)
+                                        .suffix(" px"),
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Presets:");
+                                for (label, h) in [
+                                    ("Close (180)", 180.0),
+                                    ("Normal (240)", 240.0),
+                                    ("Wide (420)", 420.0),
+                                    ("Full (800)", 800.0),
+                                    ("Orbit (1400)", 1400.0),
+                                ] {
+                                    if ui.small_button(label).clicked() {
+                                        state.camera_height = h;
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Pan Speed:");
+                                ui.add(egui::Slider::new(&mut state.camera_speed, 100.0..=1000.0).suffix(" px/s"));
+                            });
+                            ui.horizontal(|ui| {
+                                if let Some(ref mut li) = local_input {
+                                    ui.checkbox(&mut li.camera_follow_player, "Camera Follow Player");
+                                }
+                                if ui.button("🎯 Snap Camera to Player").clicked() {
+                                    state.reset_camera_requested = true;
+                                }
+                            });
+                            if let Some(ref mut tracking) = tracking_camera {
+                                ui.collapsing("📐 Tracking Camera Settings", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Speed:");
+                                        let mut s = tracking.speed as f32;
+                                        if ui.add(egui::Slider::new(&mut s, 0.5..=0.999)).changed() {
+                                            tracking.speed = s as f64;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Recenter Timeout:");
+                                        ui.add(egui::Slider::new(&mut tracking.recenter_timeout, 0.5..=10.0).suffix(" s"));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Tracking Window:");
+                                        ui.add(egui::Slider::new(&mut tracking.tracking_size.x, 0.0..=100.0).prefix("X: "));
+                                        ui.add(egui::Slider::new(&mut tracking.tracking_size.y, 0.0..=100.0).prefix("Y: "));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Clamp Window:");
+                                        ui.add(egui::Slider::new(&mut tracking.clamp_size.x, 10.0..=200.0).prefix("X: "));
+                                        ui.add(egui::Slider::new(&mut tracking.clamp_size.y, 10.0..=200.0).prefix("Y: "));
+                                    });
+                                });
+                            }
+                            ui.small("Controls: WASD (Pan when detached) | Middle-Drag (Pan) | Mouse Scroll (Zoom) | T (Teleport to Cursor)");
+                        });
+
+                        ui.add_space(4.0);
+
+                        ui.group(|ui| {
+                            ui.strong("👁 Master Debug Overlays");
+                            ui.horizontal(|ui| {
+                                if ui.button("✅ Enable All Overlays").clicked() {
+                                    state.show_actor_debug = true;
+                                    state.show_brush_cursor = true;
+                                    state.show_particles_overlay = true;
+                                    state.show_rapier_colliders = true;
+                                    state.show_rapier_terrain = true;
+                                    state.show_rapier_velocities = true;
+                                    state.show_rapier_aabbs = true;
+                                    state.show_rapier_contacts = true;
+                                    state.show_dirty_rects = true;
+                                    state.show_chunk_grid = true;
+                                }
+                                if ui.button("❌ Disable All Overlays").clicked() {
+                                    state.show_actor_debug = false;
+                                    state.show_brush_cursor = false;
+                                    state.show_particles_overlay = false;
+                                    state.show_rapier_colliders = false;
+                                    state.show_rapier_terrain = false;
+                                    state.show_rapier_velocities = false;
+                                    state.show_rapier_aabbs = false;
+                                    state.show_rapier_contacts = false;
+                                    state.show_dirty_rects = false;
+                                    state.show_chunk_grid = false;
+                                }
+                            });
+
+                            ui.add_space(2.0);
+                            ui.label("Player & Tools:");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut state.show_actor_debug, "Actor Hitbox & Aim");
+                                ui.checkbox(&mut state.show_brush_cursor, "Brush Cursor");
+                                ui.checkbox(&mut state.show_particles_overlay, "Particles Overlay");
+                            });
+
+                            ui.add_space(2.0);
+                            ui.label("Rapier2D Physics:");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut state.show_rapier_colliders, "Dynamic Colliders (Cyan)");
+                                ui.checkbox(&mut state.show_rapier_terrain, "Terrain Colliders (Orange)");
+                                ui.checkbox(&mut state.show_rapier_velocities, "Velocities (Yellow)");
+                                ui.checkbox(&mut state.show_rapier_aabbs, "Collider AABBs (Red)");
+                                ui.checkbox(&mut state.show_rapier_contacts, "Contacts & Normals");
+                            });
+
+                            ui.add_space(2.0);
+                            ui.label("Simulation Grid:");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut state.show_dirty_rects, "Dirty Rects (Purple)");
+                                ui.checkbox(&mut state.show_chunk_grid, "Chunk Grid Borders");
+                            });
+                        });
+                    }
+                });
         });
 }

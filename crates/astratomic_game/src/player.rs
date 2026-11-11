@@ -24,7 +24,10 @@ use astratomic_sim::{
 };
 use bones_framework::prelude::*;
 
-use crate::meta::GameMeta;
+use crate::{
+    camera::{TrackingCamera, Zoom, register_camera_schemas},
+    meta::GameMeta,
+};
 
 /// Bitflag for jump input (`Space`).
 pub const BTN_JUMP: u8 = 1 << 0;
@@ -181,6 +184,7 @@ pub fn register_player_schemas() {
     MatchInputs::register_schema();
     LocalView::register_schema();
     LocalInputState::register_schema();
+    register_camera_schemas();
 }
 
 /// Bones plugin that installs player spawning, input gathering, deterministic player controller,
@@ -202,6 +206,8 @@ impl SessionPlugin for AstratomicPlayerPlugin {
         session.world.init_resource::<LocalView>();
         session.world.init_resource::<LocalInputState>();
         session.world.init_resource::<ActorSimulationStamp>();
+        session.world.init_resource::<TrackingCamera>();
+        session.world.init_resource::<Zoom>();
 
         session
             .add_system_to_stage(CoreStage::Startup, setup_player_system)
@@ -228,6 +234,7 @@ pub fn setup_player_system(
     chunk_world: Res<ChunkWorld>,
     mut local_view: ResMut<LocalView>,
     mut sim_settings: ResMut<SimulationSettings>,
+    mut tracking_camera: Option<ResMut<TrackingCamera>>,
     mut entities: ResMut<Entities>,
     mut transforms: CompMut<Transform>,
     mut players: CompMut<Player>,
@@ -275,6 +282,9 @@ pub fn setup_player_system(
     local_view.camera_pos = spawn_pos;
     local_view.render_alpha = 1.0;
     sim_settings.focus_world_pos = spawn_pos;
+    if let Some(ref mut tracking) = tracking_camera {
+        tracking.snap_to(spawn_pos);
+    }
 }
 
 /// Pre-tick client input system that reads local keyboard/mouse + [`LocalView`] camera position,
@@ -813,7 +823,7 @@ pub fn player_world_action_system(
 ///
 /// Finds the entity with `player_id == local_view.local_player_id`, computes
 /// `interp_pos = actor.prev_pos.lerp(actor.pos, local_view.render_alpha)`, smoothly updates
-/// `local_view.camera_pos`, and updates actor [`Transform`] components for rendering.
+/// [`TrackingCamera`] and `local_view.camera_pos`, and updates actor [`Transform`] components for rendering.
 pub fn update_local_view_camera_system(
     time: Res<Time>,
     entities: Res<Entities>,
@@ -821,6 +831,7 @@ pub fn update_local_view_camera_system(
     actors: Comp<KinematicActor>,
     local_input: Option<Res<LocalInputState>>,
     mut local_view: ResMut<LocalView>,
+    mut tracking_camera: Option<ResMut<TrackingCamera>>,
     mut sim_settings: Option<ResMut<SimulationSettings>>,
     mut cameras: CompMut<Camera>,
     mut transforms: CompMut<Transform>,
@@ -843,19 +854,31 @@ pub fn update_local_view_camera_system(
         }
     }
 
-    // 2. Smoothly update `local_view.camera_pos` toward the local player's interpolated position.
+    // 2. Smoothly update camera tracking toward the local player's interpolated position.
     if let Some(interp_pos) = local_player_interp_pos {
-        let follow_speed = 12.0;
-        let t = (1.0 - (-follow_speed * dt).exp()).clamp(0.0, 1.0);
-        if (local_view.camera_pos - interp_pos).length_squared() > 250_000.0 {
-            local_view.camera_pos = interp_pos;
-        } else {
-            local_view.camera_pos = local_view.camera_pos.lerp(interp_pos, t);
-        }
+        let dt_f64 = time.delta_seconds_f64().clamp(0.0001, 0.1);
 
         let follow_enabled = local_input
             .as_ref()
             .is_none_or(|li| li.camera_follow_player);
+
+        if let Some(ref mut tracking) = tracking_camera {
+            // Large sudden distance jumps (teleport, respawn) snap the camera immediately.
+            if (tracking.position - interp_pos).length_squared() > 250_000.0 {
+                tracking.snap_to(interp_pos);
+            } else if follow_enabled {
+                tracking.update(interp_pos, dt_f64);
+            }
+            local_view.camera_pos = tracking.position;
+        } else {
+            let follow_speed = 12.0;
+            let t = (1.0 - (-follow_speed * dt).exp()).clamp(0.0, 1.0);
+            if (local_view.camera_pos - interp_pos).length_squared() > 250_000.0 {
+                local_view.camera_pos = interp_pos;
+            } else {
+                local_view.camera_pos = local_view.camera_pos.lerp(interp_pos, t);
+            }
+        }
 
         if follow_enabled {
             for (cam_ent, _camera) in entities.iter_with(&mut cameras) {
